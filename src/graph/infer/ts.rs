@@ -24,7 +24,16 @@ const ALIAS_SUFFIXES: [&str; 9] = [
     ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".d.ts",
 ];
 
-const TEST_DIRS: [&str; 5] = ["__tests__", "__mocks__", "test", "tests", "e2e"];
+const TEST_INFIXES: [&str; 3] = [".test.", ".spec.", ".test-d."];
+const TEST_DIRS: [&str; 7] = [
+    "__tests__",
+    "__mocks__",
+    "__fixtures__",
+    "test",
+    "tests",
+    "spec",
+    "e2e",
+];
 
 const ROOT_CONFIGS: [&str; 2] = ["tsconfig.base.json", "tsconfig.json"];
 const MAX_EXTENDS: usize = 16;
@@ -271,6 +280,15 @@ fn exists(target: &Path, workspace: &BTreeSet<&Path>) -> bool {
         })
 }
 
+/// How an import reached a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Via {
+    /// A relative path or tsconfig alias: the project's sources.
+    Source,
+    /// A package name: possibly the built package (`main`), which needs its build first.
+    Package,
+}
+
 fn resolve(
     spec: &str,
     file: &Path,
@@ -278,8 +296,8 @@ fn resolve(
     packages: &BTreeMap<String, PathBuf>,
     paths: &TsPaths,
     workspace: &BTreeSet<&Path>,
-) -> Vec<PathBuf> {
-    let owner = |p: &Path| owners.owner(p).map(Path::to_path_buf);
+) -> Vec<(PathBuf, Via)> {
+    let owner = |p: &Path| owners.owner(p).map(|o| (o.to_path_buf(), Via::Source));
     if spec.starts_with('.') {
         return file
             .parent()
@@ -293,7 +311,11 @@ fn resolve(
         .iter()
         .filter(|p| exists(p, workspace))
         .filter_map(|p| owner(p.as_path()))
-        .chain(packages.get(package_name(spec)).cloned())
+        .chain(
+            packages
+                .get(package_name(spec))
+                .map(|r| (r.clone(), Via::Package)),
+        )
         .collect()
 }
 
@@ -303,7 +325,7 @@ pub fn is_test_file(path: &Path) -> bool {
     let named = path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.contains(".test.") || n.contains(".spec."));
+        .is_some_and(|n| TEST_INFIXES.iter().any(|infix| n.contains(infix)));
     named
         || path.parent().is_some_and(|dir| {
             dir.components()
@@ -312,8 +334,9 @@ pub fn is_test_file(path: &Path) -> bool {
         })
 }
 
-/// The project roots one project imports from. A root imported by any non-test file is a
-/// dep; one imported only by test files is a dev dep.
+/// The project roots one project imports from. A root is a dev dep when test files are
+/// its only importers and all of them reach it by relative path or tsconfig alias; any
+/// package-name import may need the built package, so it makes the root a dep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Edges {
     pub deps: BTreeSet<PathBuf>,
@@ -321,8 +344,8 @@ pub struct Edges {
 }
 
 impl Edges {
-    fn add(&mut self, dep: PathBuf, from_test: bool) {
-        if !from_test {
+    fn add(&mut self, dep: PathBuf, dev: bool) {
+        if !dev {
             self.dev_deps.remove(&dep);
             self.deps.insert(dep);
         } else if !self.deps.contains(&dep) {
@@ -358,17 +381,17 @@ pub fn import_edges(
             specifiers(file, &String::from_utf8_lossy(&bytes))
                 .iter()
                 .flat_map(|spec| resolve(spec, file, owners, packages, paths, &workspace))
-                .filter(|dep| dep != project)
-                .map(|dep| (project.clone(), dep, from_test))
+                .filter(|(dep, _)| dep != project)
+                .map(|(dep, via)| (project.clone(), dep, from_test && via == Via::Source))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
         .into_iter()
-        .fold(BTreeMap::new(), |mut edges, (project, dep, from_test)| {
+        .fold(BTreeMap::new(), |mut edges, (project, dep, dev)| {
             edges
                 .entry(project)
                 .or_insert_with(Edges::default)
-                .add(dep, from_test);
+                .add(dep, dev);
             edges
         })
 }
@@ -704,10 +727,13 @@ const glued = () => import("a" + "b");
         for test in [
             "src/a.test.ts",
             "src/a.spec.tsx",
+            "src/a.test-d.ts",
             "src/__tests__/a.ts",
             "src/__mocks__/fs.ts",
+            "src/__fixtures__/data.ts",
             "test/a.ts",
             "tests/unit/a.ts",
+            "spec/a.ts",
             "e2e/login.ts",
         ] {
             assert!(is_test_file(Path::new(test)), "{test}");
@@ -717,6 +743,8 @@ const glued = () => import("a" + "b");
             "src/testing.ts",
             "src/latest/a.ts",
             "src/a.tests.ts",
+            "src/specs/a.ts",
+            "src/spec.ts",
         ] {
             assert!(!is_test_file(Path::new(source)), "{source}");
         }
@@ -729,21 +757,18 @@ const glued = () => import("a" + "b");
         write(
             root,
             "libs/a/src/a.test.ts",
-            "import '@acme/b';\nimport '@acme/c';\n",
+            "import '../../b';\nimport '../../c';\n",
         );
-        write(root, "libs/a/src/a.ts", "import '@acme/c';\n");
-        write(root, "libs/test/src/t.ts", "import '@acme/b';\n");
+        write(root, "libs/a/src/a.ts", "import '../../c';\n");
+        write(root, "libs/test/src/t.ts", "import '../../b';\n");
         write(root, "libs/b/index.ts", "");
         write(root, "libs/c/index.ts", "");
 
         let roots = ["libs/a", "libs/b", "libs/c", "libs/test"].map(PathBuf::from);
         let owners = Owners::new(roots);
         let owned = owned_files(root, &owners);
-        let packages = ["b", "c"]
-            .map(|n| (format!("@acme/{n}"), PathBuf::from(format!("libs/{n}"))))
-            .into();
 
-        let edges = import_edges(root, &owned, &owners, &packages, &TsPaths::default());
+        let edges = import_edges(root, &owned, &owners, &BTreeMap::new(), &TsPaths::default());
         assert_eq!(
             edges[Path::new("libs/a")],
             Edges {
@@ -757,6 +782,62 @@ const glued = () => import("a" + "b");
                 deps: BTreeSet::from([PathBuf::from("libs/b")]),
                 dev_deps: BTreeSet::new(),
             }
+        );
+    }
+
+    /// The edges of an explicit project `apps/web` whose only file, `x.spec.ts`, imports
+    /// `spec`. `@acme/sdk` and `@acme/core` are packages; `@sdk-src` and `@acme/core` are
+    /// tsconfig aliases.
+    fn spec_edges(spec: &str) -> Edges {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "paths": {
+                "@sdk-src": ["libs/sdk/src/index.ts"],
+                "@acme/core": ["libs/core/src/index.ts"] } } }"#,
+        );
+        write(root, "libs/sdk/src/index.ts", "");
+        write(root, "libs/core/src/index.ts", "");
+        write(root, "apps/web/x.spec.ts", &format!("import '{spec}';\n"));
+
+        let owners = Owners::new(["libs/sdk", "libs/core", "apps/web"].map(PathBuf::from));
+        let owned = owned_files(root, &owners);
+        let packages = ["sdk", "core"]
+            .map(|n| (format!("@acme/{n}"), PathBuf::from(format!("libs/{n}"))))
+            .into();
+        let paths = TsPaths::load(root).unwrap();
+        import_edges(root, &owned, &owners, &packages, &paths)
+            .remove(Path::new("apps/web"))
+            .unwrap_or_default()
+    }
+
+    fn edges(deps: &[&str], dev_deps: &[&str]) -> Edges {
+        Edges {
+            deps: deps.iter().map(PathBuf::from).collect(),
+            dev_deps: dev_deps.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    #[test]
+    fn package_name_imports_from_spec_files_stay_deps() {
+        assert_eq!(spec_edges("@acme/sdk"), edges(&["libs/sdk"], &[]));
+        assert_eq!(spec_edges("@acme/sdk/client"), edges(&["libs/sdk"], &[]));
+        // Also an alias: it may resolve to the built package, so it still orders tasks.
+        assert_eq!(spec_edges("@acme/core"), edges(&["libs/core"], &[]));
+    }
+
+    #[test]
+    fn alias_imports_from_spec_files_are_dev_deps() {
+        assert_eq!(spec_edges("@sdk-src"), edges(&[], &["libs/sdk"]));
+    }
+
+    #[test]
+    fn relative_imports_from_spec_files_are_dev_deps() {
+        assert_eq!(
+            spec_edges("../../libs/sdk/src/index"),
+            edges(&[], &["libs/sdk"])
         );
     }
 }

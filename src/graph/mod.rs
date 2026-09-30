@@ -73,8 +73,10 @@ pub struct Project {
     pub root: PathBuf,
     pub kinds: BTreeSet<Kind>,
     pub deps: BTreeSet<String>,
-    /// Dev-only edges (Cargo dev-dependencies): they feed cache keys and affected detection
-    /// but never order tasks, so cargo-legal dev cycles can't become task cycles.
+    /// Dev-only edges: Cargo dev-dependencies, and imports from test files that go through
+    /// relative paths or tsconfig aliases. They feed cache keys and affected detection but
+    /// never order tasks, so cargo-legal dev cycles and test-only imports can't become task
+    /// cycles.
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub dev_deps: BTreeSet<String>,
     pub targets: BTreeMap<String, Target>,
@@ -281,13 +283,20 @@ fn project_path(key: &str) -> Result<PathBuf> {
     })
 }
 
-/// `[projects]` entries by normalised path; two keys for one path are an error.
+/// `[projects]` entries by normalised path; two keys for one path, or a blank `name`,
+/// are errors.
 fn declared_projects(config: &Config) -> Result<BTreeMap<PathBuf, &ProjectConfig>> {
     let mut keys: BTreeMap<PathBuf, &str> = BTreeMap::new();
     config
         .projects
         .iter()
         .map(|(key, project)| {
+            if project.name.as_ref().is_some_and(|n| n.trim().is_empty()) {
+                return Err(Error::Config {
+                    path: PathBuf::from(config::FILE),
+                    message: format!("project `{key}` has a blank `name`"),
+                });
+            }
             let path = project_path(key)?;
             match keys.insert(path.clone(), key) {
                 Some(first) => Err(Error::Config {
@@ -641,6 +650,25 @@ outputs = []
     }
 
     #[test]
+    fn blank_declared_names_are_a_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["", "  "] {
+            write(
+                dir.path(),
+                "axonal.toml",
+                &format!("[projects.\"libs/a\"]\nname = \"{name}\"\n"),
+            );
+            match Workspace::discover(dir.path()) {
+                Err(Error::Config { message, .. }) => {
+                    assert!(message.contains("`libs/a`"), "{message}");
+                    assert!(message.contains("name"), "{message}");
+                }
+                other => panic!("expected a config error for {name:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn deps_naming_one_project_by_path_and_another_by_name_are_ambiguous() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "pnpm-workspace.yaml", "packages: ['ui']\n");
@@ -763,9 +791,17 @@ command = "true"
     #[test]
     fn test_file_imports_are_dev_edges_and_break_cycles() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "pnpm-workspace.yaml", "packages: ['libs/*']\n");
-        write(dir.path(), "libs/a/package.json", r#"{"name":"@acme/a"}"#);
-        write(dir.path(), "libs/b/package.json", r#"{"name":"@acme/b"}"#);
+        write(
+            dir.path(),
+            "tsconfig.base.json",
+            r#"{ "compilerOptions": { "paths": {
+                "@acme/a": ["libs/a/src/a.ts"], "@acme/b": ["libs/b/src/b.ts"] } } }"#,
+        );
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.\"libs/a\"]\n\n[projects.\"libs/b\"]\n",
+        );
         write(dir.path(), "libs/a/src/a.ts", "export const a = 1;\n");
         write(
             dir.path(),
@@ -778,11 +814,11 @@ command = "true"
             "import { a } from '@acme/a';\n",
         );
         let ws = Workspace::discover(dir.path()).unwrap();
-        let a = &ws.projects["@acme/a"];
-        let b = &ws.projects["@acme/b"];
+        let a = &ws.projects["libs/a"];
+        let b = &ws.projects["libs/b"];
         assert!(a.deps.is_empty());
-        assert_eq!(a.dev_deps, BTreeSet::from(["@acme/b".to_string()]));
-        assert_eq!(b.deps, BTreeSet::from(["@acme/a".to_string()]));
+        assert_eq!(a.dev_deps, BTreeSet::from(["libs/b".to_string()]));
+        assert_eq!(b.deps, BTreeSet::from(["libs/a".to_string()]));
         assert!(b.dev_deps.is_empty());
     }
 
