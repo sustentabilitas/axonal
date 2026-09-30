@@ -6,7 +6,7 @@ use std::{
 };
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
+use ignore::{DirEntry, WalkBuilder};
 
 use crate::{
     config,
@@ -18,16 +18,24 @@ pub const WORKSPACE_PREFIX: &str = "{workspace}/";
 
 const SKIPPED_DIRS: [&str; 3] = [".git", ".axonal", "node_modules"];
 
-/// Every file under `root` that git would not ignore, relative to `root` and sorted.
+fn is_skipped(entry: &DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(|n| SKIPPED_DIRS.contains(&n))
+}
+
+/// Every file under `root` not ignored by the repo's own `.gitignore` files (global
+/// excludes, `.git/info/exclude` and `.ignore` files are not consulted), relative to
+/// `root` and sorted.
 pub fn list(root: &Path) -> Result<Vec<PathBuf>> {
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .require_git(false)
-        .filter_entry(|e| {
-            !e.file_name()
-                .to_str()
-                .is_some_and(|n| SKIPPED_DIRS.contains(&n))
-        })
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .filter_entry(|e| !is_skipped(e))
         .build();
     let mut files = walker
         .filter_map(|entry| match entry {
@@ -98,13 +106,21 @@ impl Patterns {
         let (workspace_globs, project_globs): (Vec<String>, Vec<String>) =
             globs
                 .iter()
-                .fold((Vec::new(), Vec::new()), |(mut ws, mut proj), g| {
-                    match g.strip_prefix(WORKSPACE_PREFIX) {
+                .try_fold((Vec::new(), Vec::new()), |(mut ws, mut proj), g| {
+                    let rest = g.strip_prefix(WORKSPACE_PREFIX);
+                    let rel = rest.unwrap_or(g);
+                    if Path::new(rel).is_absolute() || rel.split('/').any(|seg| seg == "..") {
+                        return Err(Error::Config {
+                            path: PathBuf::from(config::FILE),
+                            message: format!("glob `{g}` must not be absolute or contain `..`"),
+                        });
+                    }
+                    match rest {
                         Some(rest) => ws.push(rest.to_string()),
                         None => proj.push(g.clone()),
                     }
-                    (ws, proj)
-                });
+                    Ok((ws, proj))
+                })?;
         Ok(Self {
             project: glob_set(&project_globs)?,
             workspace: glob_set(&workspace_globs)?,
@@ -138,7 +154,14 @@ impl Patterns {
                 if !start.exists() {
                     continue;
                 }
-                for entry in WalkBuilder::new(&start).standard_filters(false).build() {
+                let walker = WalkBuilder::new(&start)
+                    .standard_filters(false)
+                    .filter_entry(|e| {
+                        e.depth() == 0
+                            || !(e.file_type().is_some_and(|t| t.is_dir()) && is_skipped(e))
+                    })
+                    .build();
+                for entry in walker {
                     let entry = entry.map_err(|e| Error::Io(std::io::Error::other(e)))?;
                     if !entry.file_type().is_some_and(|t| t.is_file()) {
                         continue;
@@ -267,6 +290,40 @@ mod tests {
             Patterns::new(&["src/[".into()]),
             Err(Error::Config { .. })
         ));
+    }
+
+    #[test]
+    fn escaping_globs_are_config_errors() {
+        for glob in ["../x/**", "{workspace}/../x", "/abs/**"] {
+            assert!(
+                matches!(Patterns::new(&[glob.into()]), Err(Error::Config { .. })),
+                "{glob}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_files_skip_tool_dirs_below_the_walk_start() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "libs/a/dist/a.js",
+            "libs/a/node_modules/x/i.js",
+            "libs/a/node_modules/.cache/c.js",
+            "libs/a/.axonal/cache/k.js",
+        ] {
+            touch(dir.path(), f);
+        }
+        let root = Path::new("libs/a");
+        let all = Patterns::new(&["**/*.js".into()]).unwrap();
+        assert_eq!(
+            all.existing_files(dir.path(), root).unwrap(),
+            paths(&["libs/a/dist/a.js"])
+        );
+        let cache = Patterns::new(&["node_modules/.cache/**".into()]).unwrap();
+        assert_eq!(
+            cache.existing_files(dir.path(), root).unwrap(),
+            paths(&["libs/a/node_modules/.cache/c.js"])
+        );
     }
 
     #[test]
