@@ -170,7 +170,7 @@ impl Local {
     }
 
     /// Metadata first, so a partly removed entry is never visible.
-    fn remove(&self, key: &Key) -> io::Result<()> {
+    fn remove_files(&self, key: &Key) -> io::Result<()> {
         let (archive, meta) = self.paths(key);
         existing(fs::remove_file(meta))?;
         existing(fs::remove_file(archive)).map(drop)
@@ -209,7 +209,7 @@ impl Local {
             return Ok(());
         };
         if existing(fs::read(self.paths(key).1))?.is_some_and(|current| current == meta_bytes) {
-            self.remove(key)?;
+            self.remove_files(key)?;
         }
         Ok(())
     }
@@ -263,7 +263,7 @@ impl Local {
                 })
             })
             .try_fold(0, |removed, item| {
-                self.remove(&item.key).map(|()| removed + 1)
+                self.remove_files(&item.key).map(|()| removed + 1)
             })
     }
 
@@ -280,6 +280,14 @@ impl Local {
 }
 
 impl Store for Local {
+    fn remove(&self, key: &Key) -> Result<(), CacheError> {
+        self.checked_paths(key)?;
+        let Some(_lock) = self.lock(Lock::Exclusive)? else {
+            return Ok(());
+        };
+        Ok(self.remove_files(key)?)
+    }
+
     fn get(&self, key: &Key) -> Result<Option<Entry>, CacheError> {
         let (archive_path, meta_path) = self.checked_paths(key)?;
         let (meta_bytes, archive) = {
@@ -406,7 +414,7 @@ mod tests {
     fn staged(key: &Key, tag: &str) -> (tempfile::TempDir, Meta, Packed) {
         let src = tempfile::tempdir().unwrap();
         fs::write(src.path().join("out.txt"), tag).unwrap();
-        let packed = archive::pack(src.path(), &[PathBuf::from("out.txt")]).unwrap();
+        let packed = archive::pack(src.path(), &[PathBuf::from("out.txt")], 0).unwrap();
         let meta = Meta::new(key.clone(), 0, 5, tag.into(), &packed);
         (src, meta, packed)
     }
@@ -508,6 +516,24 @@ mod tests {
         assert!(matches!(err, Err(CacheError::WrongKey { .. })), "{err:?}");
         assert!(store.get(&k2).unwrap().is_none());
         assert!(store.get(&k1).unwrap().is_some());
+    }
+
+    #[test]
+    fn remove_deletes_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        let (k1, k2) = (Key("k1".into()), Key("k2".into()));
+        put(&store, &k1, "hello");
+        put(&store, &k2, "other");
+        store.remove(&k1).unwrap();
+        assert!(store.get(&k1).unwrap().is_none());
+        assert!(store.get(&k2).unwrap().is_some());
+        store.remove(&k1).unwrap();
+        assert!(matches!(
+            store.remove(&Key("../x".into())),
+            Err(CacheError::InvalidKey(_))
+        ));
+        assert_eq!(names(&store), [".lock", "k2.json", "k2.tar.zst"]);
     }
 
     #[test]

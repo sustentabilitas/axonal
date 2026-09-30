@@ -12,7 +12,6 @@ use std::{
 use super::{CacheError, Meta, TMP_DIR, existing, temp::Temp};
 
 const LEVEL: i32 = 3;
-const MAX_WORKERS: usize = 4;
 /// Largest decoder window accepted (128 MiB); level 3 needs far less.
 const WINDOW_LOG_MAX: u32 = 27;
 /// Caps on any archive, whatever its metadata declares.
@@ -37,20 +36,44 @@ impl Packed {
 
 /// Archives `files`, workspace-relative regular files, under their relative paths. A
 /// symlink anywhere on an output's path is `CacheError::Symlink`: such outputs are not
-/// cacheable.
-pub fn pack(root: &Path, files: &[PathBuf]) -> Result<Packed, CacheError> {
+/// cacheable. Each file is archived at its length when opened; one that shrinks while
+/// being read fails the pack.
+///
+/// `workers` zstd threads compress in parallel, each buffering about 20 MB; 0 compresses
+/// on the calling thread.
+pub fn pack(root: &Path, files: &[PathBuf], workers: u32) -> Result<Packed, CacheError> {
+    pack_with(root, files, workers, &|_| {})
+}
+
+/// `opened` runs once each file's length is fixed, before it is read.
+fn pack_with(
+    root: &Path,
+    files: &[PathBuf],
+    workers: u32,
+    opened: &dyn Fn(&Path),
+) -> Result<Packed, CacheError> {
     if files.len() > MAX_FILES {
         return Err(CacheError::TooLarge);
     }
     let (temp, file) = Temp::file(&root.join(TMP_DIR), "", ".tar.zst")?;
     let mut encoder = zstd::Encoder::new(Hashing::new(BufWriter::new(file)), LEVEL)?;
-    encoder.multithread(workers())?;
+    if workers > 0 {
+        encoder.multithread(workers)?;
+    }
     let mut builder = tar::Builder::new(encoder);
     builder.follow_symlinks(false);
     let unpacked_bytes = files.iter().try_fold(0u64, |total, rel| {
-        let mut file = open_output(root, rel)?;
-        let len = file.metadata()?.len();
-        builder.append_file(rel, &mut file)?;
+        let (mut file, meta) = open_output(root, rel)?;
+        let len = meta.len();
+        opened(rel);
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata(&meta);
+        header.set_size(len);
+        let exact = Exact {
+            file: (&mut file).take(len),
+            path: rel,
+        };
+        builder.append_data(&mut header, rel, exact)?;
         total
             .checked_add(len)
             .filter(|&total| total <= MAX_UNPACKED_BYTES)
@@ -68,12 +91,9 @@ pub fn pack(root: &Path, files: &[PathBuf]) -> Result<Packed, CacheError> {
     })
 }
 
-fn workers() -> u32 {
-    std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_WORKERS)) as u32
-}
-
-/// Opens a regular file, refusing symlinks on its path and swaps after the check.
-fn open_output(root: &Path, rel: &Path) -> Result<File, CacheError> {
+/// Opens a regular file with its metadata, refusing symlinks on its path and swaps after
+/// the check.
+fn open_output(root: &Path, rel: &Path) -> Result<(File, fs::Metadata), CacheError> {
     if !is_plain(rel) {
         return Err(CacheError::InvalidPath(rel.to_path_buf()));
     }
@@ -86,10 +106,30 @@ fn open_output(root: &Path, rel: &Path) -> Result<File, CacheError> {
     })?;
     let leaf = leaf.filter(fs::Metadata::is_file);
     let file = File::open(root.join(rel))?;
+    let meta = file.metadata()?;
     match leaf {
-        Some(leaf) if same_file(&leaf, &file.metadata()?) => Ok(file),
+        Some(leaf) if same_file(&leaf, &meta) => Ok((file, meta)),
         Some(_) => Err(CacheError::Symlink(rel.to_path_buf())),
         None => Err(CacheError::NotAFile(rel.to_path_buf())),
+    }
+}
+
+/// The first `len` bytes of a file, failing if it ends sooner.
+struct Exact<'a> {
+    file: io::Take<&'a mut File>,
+    path: &'a Path,
+}
+
+impl Read for Exact<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read(buf)?;
+        if n == 0 && !buf.is_empty() && self.file.limit() > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("`{}` shrank while being packed", self.path.display()),
+            ));
+        }
+        Ok(n)
     }
 }
 
@@ -136,14 +176,23 @@ impl<W: Write> Write for Hashing<W> {
 }
 
 /// Replaces `stale`, the workspace-relative outputs currently present, with the archive's
-/// files, all or nothing.
+/// files.
 ///
 /// The archive is extracted into a staging directory under [`TMP_DIR`] and must hold
-/// exactly `meta.outputs`, within `meta.unpacked_bytes`. Stale files (links themselves,
-/// never their targets) are then moved aside and the staged files renamed into place; a
-/// failure at any point undoes those moves. Nothing is read or written through a
-/// symlinked directory: one in the way is `CacheError::Blocked`, unless it is itself
-/// stale.
+/// exactly `meta.outputs`, without duplicates and within `meta.unpacked_bytes`. Stale
+/// files (links themselves, never their targets) are then moved aside and the staged
+/// files renamed into place. Nothing is read or written through a symlinked directory:
+/// one in the way is `CacheError::Blocked`, unless it is itself stale. On success,
+/// directories left empty by removing stale files are removed too, up to `root`.
+///
+/// The restore is all or nothing for every error it returns: those moves are undone and
+/// the workspace is as it was. It is not if the process is killed midway, which can leave
+/// some outputs placed and some stale files parked in the staging directory; the next run
+/// then sees whatever outputs are present as stale, and `Local::evict` sweeps the staging
+/// directory once its process has gone.
+///
+/// Errors for which [`CacheError::is_archive_fault`] holds mean the entry itself is
+/// unusable, so the caller should remove it.
 pub fn restore(
     root: &Path,
     meta: &Meta,
@@ -161,33 +210,50 @@ pub fn restore(
     };
     commit
         .run(&meta.outputs, stale)
-        .inspect_err(|_| commit.undo())
+        .inspect_err(|_| commit.undo())?;
+    prune(root, stale);
+    Ok(())
+}
+
+/// Best effort: removes each stale file's ancestors, deepest first, while they are
+/// empty, never `root` itself.
+fn prune(root: &Path, stale: &[PathBuf]) {
+    stale.iter().for_each(|rel| {
+        let _ = rel
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| !dir.as_os_str().is_empty())
+            .try_for_each(|dir| fs::remove_dir(root.join(dir)));
+    });
 }
 
 fn extract(meta: &Meta, archive: impl Read, dst: &Path) -> Result<(), CacheError> {
+    let expected = meta.outputs.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.len() != meta.outputs.len() {
+        return Err(CacheError::OutputsMismatch);
+    }
     let max_files = meta.outputs.len().min(MAX_FILES);
     let max_bytes = meta.unpacked_bytes.min(MAX_UNPACKED_BYTES);
     let mut decoder = zstd::Decoder::new(archive)?;
     decoder.window_log_max(WINDOW_LOG_MAX)?;
     let mut archive = tar::Archive::new(decoder);
-    let (seen, bytes) =
-        archive
-            .entries()?
-            .try_fold((BTreeSet::new(), 0u64), |(mut seen, bytes), entry| {
-                let mut entry = entry?;
-                let rel = entry_path(&entry)?;
-                let bytes = bytes.saturating_add(entry.size());
-                if seen.len() >= max_files || bytes > max_bytes {
-                    return Err(CacheError::TooLarge);
-                }
-                if !seen.insert(rel.clone()) {
-                    return Err(CacheError::OutputsMismatch);
-                }
-                write_file(&mut entry, &dst.join(rel))?;
-                Ok((seen, bytes))
-            })?;
-    if seen != meta.outputs.iter().cloned().collect::<BTreeSet<_>>() || bytes != meta.unpacked_bytes
-    {
+    let (seen, bytes) = archive
+        .entries()
+        .map_err(CacheError::BadArchive)?
+        .try_fold((BTreeSet::new(), 0u64), |(mut seen, bytes), entry| {
+            let mut entry = entry.map_err(CacheError::BadArchive)?;
+            let rel = entry_path(&entry)?;
+            let bytes = bytes.saturating_add(entry.size());
+            if seen.len() >= max_files || bytes > max_bytes {
+                return Err(CacheError::TooLarge);
+            }
+            if !seen.insert(rel.clone()) {
+                return Err(CacheError::OutputsMismatch);
+            }
+            write_file(&mut entry, &dst.join(rel))?;
+            Ok((seen, bytes))
+        })?;
+    if seen != expected || bytes != meta.unpacked_bytes {
         return Err(CacheError::OutputsMismatch);
     }
     Ok(())
@@ -195,7 +261,7 @@ fn extract(meta: &Meta, archive: impl Read, dst: &Path) -> Result<(), CacheError
 
 /// Only regular files at plain relative paths; parent directories are implied.
 fn entry_path<R: Read>(entry: &tar::Entry<R>) -> Result<PathBuf, CacheError> {
-    let path = entry.path()?.into_owned();
+    let path = entry.path().map_err(CacheError::BadArchive)?.into_owned();
     if entry.header().entry_type() != tar::EntryType::Regular {
         Err(CacheError::NotAFile(path))
     } else if !is_plain(&path) {
@@ -212,7 +278,13 @@ fn write_file<R: Read>(entry: &mut tar::Entry<R>, path: &Path) -> Result<(), Cac
         fs::create_dir_all(parent)?;
     }
     let mut file = File::create_new(path)?;
-    io::copy(entry, &mut file)?;
+    let mut buf = vec![0; 64 << 10];
+    loop {
+        match entry.read(&mut buf).map_err(CacheError::BadArchive)? {
+            0 => break,
+            n => file.write_all(&buf[..n])?,
+        }
+    }
     let header = entry.header();
     if let Ok(secs) = header.mtime() {
         file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))?;
@@ -272,6 +344,9 @@ impl Commit<'_> {
             Some(meta) if meta.is_dir() => Err(CacheError::Blocked(rel.to_path_buf())),
             Some(_) => {
                 let aside = self.old.join(rel);
+                if existing(fs::symlink_metadata(&aside))?.is_some() {
+                    return Err(CacheError::OutputsMismatch);
+                }
                 if let Some(parent) = aside.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -362,7 +437,7 @@ mod tests {
             .iter()
             .map(|(rel, _)| PathBuf::from(rel))
             .collect::<Vec<_>>();
-        let packed = pack(src.path(), &rels).unwrap();
+        let packed = pack(src.path(), &rels, 0).unwrap();
         let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
         (src, packed, meta)
     }
@@ -472,7 +547,7 @@ mod tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        let packed = pack(src.path(), &paths(&["bin/run"])).unwrap();
+        let packed = pack(src.path(), &paths(&["bin/run"]), 0).unwrap();
         let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
 
         let dst = tempfile::tempdir().unwrap();
@@ -693,7 +768,7 @@ mod tests {
         symlink(outer.path().join("home/creds"), ws.join("dist/config")).unwrap();
         symlink("a.js", ws.join("dist/b.js")).unwrap();
         for leaf in ["dist/config", "dist/b.js"] {
-            let err = pack(&ws, &paths(&["dist/a.js", leaf]));
+            let err = pack(&ws, &paths(&["dist/a.js", leaf]), 0);
             assert!(
                 matches!(&err, Err(CacheError::Symlink(p)) if p == Path::new(leaf)),
                 "{leaf}: {err:?}"
@@ -708,7 +783,7 @@ mod tests {
         let (outer, ws) = workspace();
         touch(outer.path(), "elsewhere/x.js", "x");
         std::os::unix::fs::symlink(outer.path().join("elsewhere"), ws.join("dist")).unwrap();
-        let err = pack(&ws, &paths(&["dist/x.js"]));
+        let err = pack(&ws, &paths(&["dist/x.js"]), 0);
         assert!(
             matches!(&err, Err(CacheError::Symlink(p)) if p == Path::new("dist")),
             "{err:?}"
@@ -722,14 +797,185 @@ mod tests {
         fs::create_dir(ws.join("dir")).unwrap();
         let abs = outer.path().join("x");
         for bad in [Path::new("../x"), abs.as_path(), Path::new("./x")] {
-            let err = pack(&ws, &[bad.to_path_buf()]);
+            let err = pack(&ws, &[bad.to_path_buf()], 0);
             assert!(
                 matches!(err, Err(CacheError::InvalidPath(_))),
                 "{bad:?}: {err:?}"
             );
         }
-        let err = pack(&ws, &paths(&["dir"]));
+        let err = pack(&ws, &paths(&["dir"]), 0);
         assert!(matches!(err, Err(CacheError::NotAFile(_))), "{err:?}");
+    }
+
+    #[test]
+    fn duplicate_outputs_are_rejected_without_losing_originals() {
+        let (_src, packed, mut meta) = packed(&[("dist/a.js", "NEW")]);
+        meta.outputs = paths(&["dist/a.js", "dist/a.js"]);
+        for stale in [vec![], paths(&["dist/a.js"])] {
+            let dst = tempfile::tempdir().unwrap();
+            touch(dst.path(), "dist/a.js", "ORIGINAL");
+            let err = restore(
+                dst.path(),
+                &meta,
+                File::open(packed.path()).unwrap(),
+                &stale,
+            );
+            assert!(matches!(err, Err(CacheError::OutputsMismatch)), "{err:?}");
+            assert_eq!(
+                fs::read_to_string(dst.path().join("dist/a.js")).unwrap(),
+                "ORIGINAL"
+            );
+            assert!(scratch_is_empty(dst.path()));
+        }
+    }
+
+    #[test]
+    fn moving_aside_never_overwrites_a_parked_file() {
+        let ws = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let (new, old) = (staging.path().join("new"), staging.path().join("old"));
+        touch(ws.path(), "a.js", "current");
+        touch(&old, "a.js", "parked");
+        let mut commit = Commit {
+            root: ws.path(),
+            new: &new,
+            old: &old,
+            done: Vec::new(),
+        };
+        assert!(commit.move_aside(Path::new("a.js")).is_err());
+        assert_eq!(
+            fs::read_to_string(ws.path().join("a.js")).unwrap(),
+            "current"
+        );
+        assert_eq!(fs::read_to_string(old.join("a.js")).unwrap(), "parked");
+    }
+
+    #[test]
+    fn a_file_growing_while_packed_is_archived_at_its_opened_length() {
+        use std::io::Write;
+        let src = tempfile::tempdir().unwrap();
+        touch(src.path(), "log.txt", "first");
+        let grow = |rel: &Path| {
+            File::options()
+                .append(true)
+                .open(src.path().join(rel))
+                .unwrap()
+                .write_all(b" and more")
+                .unwrap()
+        };
+        let packed = pack_with(src.path(), &paths(&["log.txt"]), 0, &grow).unwrap();
+        assert_eq!(packed.unpacked_bytes, 5);
+        let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
+        let dst = tempfile::tempdir().unwrap();
+        restore(dst.path(), &meta, File::open(packed.path()).unwrap(), &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(dst.path().join("log.txt")).unwrap(),
+            "first"
+        );
+    }
+
+    #[test]
+    fn a_file_shrinking_while_packed_fails_the_pack() {
+        let src = tempfile::tempdir().unwrap();
+        touch(src.path(), "log.txt", "first");
+        let shrink = |rel: &Path| {
+            File::options()
+                .write(true)
+                .open(src.path().join(rel))
+                .unwrap()
+                .set_len(2)
+                .unwrap()
+        };
+        assert!(pack_with(src.path(), &paths(&["log.txt"]), 0, &shrink).is_err());
+        assert!(scratch_is_empty(src.path()));
+    }
+
+    #[test]
+    fn multithreaded_packing_round_trips() {
+        let src = tempfile::tempdir().unwrap();
+        let body = "multithreaded ".repeat(200_000);
+        touch(src.path(), "dist/big.txt", &body);
+        let packed = pack(src.path(), &paths(&["dist/big.txt"]), 2).unwrap();
+        let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
+        let dst = tempfile::tempdir().unwrap();
+        restore(dst.path(), &meta, File::open(packed.path()).unwrap(), &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(dst.path().join("dist/big.txt")).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn archive_faults_are_told_apart_from_workspace_problems() {
+        let (_src, packed, meta) = packed(&[("dist/a.js", &"a".repeat(100_000))]);
+        let bytes = read(packed.path());
+        let restore_into = |meta: &Meta, bytes: &[u8]| {
+            let dst = tempfile::tempdir().unwrap();
+            touch(dst.path(), "dist/a.js/in-the-way", "x");
+            restore(dst.path(), meta, bytes, &[]).unwrap_err()
+        };
+
+        let truncated = restore_into(&meta, &bytes[..bytes.len() / 2]);
+        assert!(
+            matches!(truncated, CacheError::BadArchive(_)),
+            "{truncated:?}"
+        );
+        let garbage = restore_into(&meta, b"not an archive");
+        assert!(matches!(garbage, CacheError::BadArchive(_)), "{garbage:?}");
+        let too_large = restore_into(
+            &Meta {
+                unpacked_bytes: 1,
+                ..meta.clone()
+            },
+            &bytes,
+        );
+        let mismatch = restore_into(
+            &Meta {
+                outputs: paths(&["dist/b.js"]),
+                ..meta.clone()
+            },
+            &bytes,
+        );
+        let link = raw("link", tar::EntryType::Symlink, 0o644, Some("x"));
+        let not_a_file = restore_into(&meta, &link);
+        let absolute = raw("/abs", tar::EntryType::Regular, 0o644, None);
+        let invalid_path = restore_into(&meta, &absolute);
+        for fault in [
+            truncated,
+            garbage,
+            too_large,
+            mismatch,
+            not_a_file,
+            invalid_path,
+        ] {
+            assert!(fault.is_archive_fault(), "{fault:?}");
+        }
+
+        let blocked = restore_into(&meta, &bytes);
+        assert!(matches!(blocked, CacheError::Blocked(_)), "{blocked:?}");
+        assert!(!blocked.is_archive_fault());
+        assert!(!CacheError::Io(io::Error::other("disk full")).is_archive_fault());
+    }
+
+    #[test]
+    fn directories_emptied_by_a_restore_are_removed() {
+        let (_src, packed, meta) = packed(&[("dist/a.js", "new")]);
+        let dst = tempfile::tempdir().unwrap();
+        touch(dst.path(), "dist/old/deeper/x.js", "stale");
+        touch(dst.path(), "dist/keep/y.js", "not an output");
+        touch(dst.path(), "top.js", "stale");
+        let stale = paths(&["dist/old/deeper/x.js", "top.js"]);
+        restore(
+            dst.path(),
+            &meta,
+            File::open(packed.path()).unwrap(),
+            &stale,
+        )
+        .unwrap();
+        assert!(!dst.path().join("dist/old").exists());
+        assert!(dst.path().join("dist/keep/y.js").exists());
+        assert!(dst.path().join("dist/a.js").exists());
+        assert!(dst.path().exists());
     }
 
     /// Run with `cargo test --release -- --ignored packs_large_outputs` under
@@ -757,7 +1003,7 @@ mod tests {
                 rel
             })
             .collect::<Vec<_>>();
-        let packed = pack(src.path(), &files).unwrap();
+        let packed = pack(src.path(), &files, 0).unwrap();
         assert_eq!(packed.unpacked_bytes, 200 << 20);
         let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
         let dst = tempfile::tempdir().unwrap();

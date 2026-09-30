@@ -77,11 +77,27 @@ pub enum CacheError {
     OutputsMismatch,
     #[error("`{}` is in the way of restored outputs", .0.display())]
     Blocked(PathBuf),
+    #[error("unreadable archive: {0}")]
+    BadArchive(io::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
 
 impl CacheError {
+    /// Whether a failed restore was caused by the archive's contents, so the entry
+    /// should be removed. `InvalidPath` also covers stale paths, which `existing_files`
+    /// never produces.
+    pub fn is_archive_fault(&self) -> bool {
+        matches!(
+            self,
+            CacheError::TooLarge
+                | CacheError::OutputsMismatch
+                | CacheError::InvalidPath(_)
+                | CacheError::NotAFile(_)
+                | CacheError::BadArchive(_)
+        )
+    }
+
     /// Whether the stored entry itself is bad, rather than the attempt to read it.
     pub fn is_corrupt(&self) -> bool {
         matches!(
@@ -109,4 +125,6 @@ pub trait Store: Send + Sync {
     /// Moves the archive file at `archive`, described by `meta`, into the store. The file
     /// is consumed even if the put fails.
     fn put(&self, key: &Key, meta: &Meta, archive: &Path) -> Result<(), CacheError>;
+    /// Deletes the entry, if any, e.g. after its restore failed with an archive fault.
+    fn remove(&self, key: &Key) -> Result<(), CacheError>;
 }
