@@ -168,8 +168,9 @@ impl Patterns {
     /// Existing non-directories matching these globs, found by walking each glob's literal
     /// base without gitignore filtering (outputs are usually ignored) and skipping `.git`,
     /// `.axonal` and `node_modules` below it. Symlinks are reported, never followed: a
-    /// matching link is a leaf, and a symlink on the glob base's own path is reported
-    /// whether or not it matches, since everything the glob could match lies behind it.
+    /// matching link is a leaf, and a symlink on the path to the glob base, the project
+    /// root included, is reported whether or not it matches, since everything the glob
+    /// could match lies behind it.
     /// Workspace-relative and sorted.
     pub fn existing_files(&self, root: &Path, project_root: &Path) -> Result<Vec<PathBuf>> {
         [
@@ -196,11 +197,15 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    /// Descends `glob_base` one component at a time, stopping at the first missing path or
-    /// symlink.
+    /// Descends from the workspace root through `base` and `glob_base` one component at a
+    /// time, stopping at the first missing path or symlink, then walks what it reached.
     fn start(&self, glob_base: &Path, found: &mut BTreeSet<PathBuf>) -> Result<()> {
-        let mut rel = self.base.to_path_buf();
-        let mut parts = glob_base.components().peekable();
+        let mut rel = PathBuf::new();
+        let mut parts = self
+            .base
+            .components()
+            .chain(glob_base.components())
+            .peekable();
         while let Some(part) = parts.next() {
             rel.push(part);
             let Some(meta) = symlink_metadata(&self.root.join(&rel))? else {
@@ -501,6 +506,27 @@ mod tests {
                 paths(&["libs/a/dist"]),
                 "{glob}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_files_never_follow_a_symlinked_project_root() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "elsewhere/a/dist/x.js");
+        fs::create_dir_all(dir.path().join("libs")).unwrap();
+        symlink(dir.path().join("elsewhere/a"), dir.path().join("libs/a")).unwrap();
+        symlink(dir.path().join("elsewhere"), dir.path().join("linked")).unwrap();
+        for (project, expected) in [("libs/a", "libs/a"), ("linked/a", "linked")] {
+            for glob in ["dist/**", "**/*"] {
+                let p = Patterns::new(&[glob.into()]).unwrap();
+                assert_eq!(
+                    p.existing_files(dir.path(), Path::new(project)).unwrap(),
+                    paths(&[expected]),
+                    "{project} {glob}"
+                );
+            }
         }
     }
 
