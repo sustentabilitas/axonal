@@ -34,12 +34,16 @@ pub struct Config {
 pub struct WorkspaceConfig {
     #[serde(default = "default_branch")]
     pub default_branch: String,
+    /// Workspace-relative globs every task hashes; literal ones count even if gitignored.
+    #[serde(default)]
+    pub inputs: Vec<String>,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             default_branch: default_branch(),
+            inputs: Vec::new(),
         }
     }
 }
@@ -209,6 +213,19 @@ mode = "shadow"
         );
         assert_eq!(c.cache.local_max_bytes().unwrap(), 500 << 20);
         assert!(c.prune.is_some());
+    }
+
+    #[test]
+    fn workspace_inputs_are_workspace_relative_globs() {
+        let c = Config::parse(
+            "[workspace]\ninputs = [\".tool-versions\", \"ci/*.env\"]\n",
+            Path::new(FILE),
+        )
+        .unwrap();
+        assert_eq!(c.workspace.inputs, [".tool-versions", "ci/*.env"]);
+        assert_eq!(c.workspace.default_branch, "main");
+        assert!(Config::default().workspace.inputs.is_empty());
+        assert!(Config::parse("[workspace]\ninput = []\n", Path::new(FILE)).is_err());
     }
 
     #[test]

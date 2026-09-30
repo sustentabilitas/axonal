@@ -128,36 +128,14 @@ impl TsPaths {
     /// As in TypeScript, a file beats the files it extends and later `extends` entries beat
     /// earlier ones; the highest-ranked file that sets `paths` (or `baseUrl`) wins.
     pub fn load(root: &Path) -> Result<TsPaths> {
-        let mut chain: Vec<(PathBuf, TsConfig)> = Vec::new();
-        let mut visited = BTreeSet::new();
-        let mut pending: Vec<PathBuf> = ROOT_CONFIGS
+        let start = ROOT_CONFIGS
             .into_iter()
             .map(PathBuf::from)
-            .find(|f| root.join(f).is_file())
+            .find(|f| root.join(f).is_file());
+        let chain = walk_extends(root, start.into_iter().collect())
             .into_iter()
-            .collect();
-        // Depth-first with the last `extends` entry popped first yields highest rank first.
-        while let Some(rel) = pending.pop().filter(|_| chain.len() < MAX_EXTENDS) {
-            if !visited.insert(rel.clone()) {
-                continue;
-            }
-            let path = root.join(&rel);
-            let config_error = |message: String| Error::Config {
-                path: path.clone(),
-                message,
-            };
-            let src = std::fs::read_to_string(&path).map_err(|e| config_error(e.to_string()))?;
-            let config: TsConfig = serde_json::from_str(&strip_jsonc(&src))
-                .map_err(|e| config_error(e.to_string()))?;
-            let dir = rel.parent().map(Path::to_path_buf).unwrap_or_default();
-            pending.extend(
-                config
-                    .extends
-                    .iter()
-                    .flat_map(|extends| relative_extends(extends, &dir)),
-            );
-            chain.push((dir, config));
-        }
+            .map(|(rel, config)| config.map(|c| (parent_dir(&rel), c)))
+            .collect::<Result<Vec<_>>>()?;
         let paths = chain
             .iter()
             .find_map(|(dir, c)| c.compiler_options.paths.as_ref().map(|p| (dir, p)));
@@ -201,6 +179,61 @@ impl TsPaths {
             })
             .collect()
     }
+}
+
+/// Every root tsconfig (`tsconfig.base.json`, `tsconfig.json`) and the files their relative
+/// `extends` chains name, whether or not they exist or parse. Workspace-relative, sorted.
+pub fn config_files(root: &Path) -> Vec<PathBuf> {
+    let starts = ROOT_CONFIGS
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|f| root.join(f).is_file())
+        .collect();
+    walk_extends(root, starts)
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The configs reachable from `starts` through relative `extends`, highest rank first,
+/// each with its parse result; an unreadable or invalid config ends its branch.
+fn walk_extends(root: &Path, starts: Vec<PathBuf>) -> Vec<(PathBuf, Result<TsConfig>)> {
+    let mut chain: Vec<(PathBuf, Result<TsConfig>)> = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut pending = starts;
+    // Depth-first with the last `extends` entry popped first yields highest rank first.
+    while let Some(rel) = pending.pop().filter(|_| chain.len() < MAX_EXTENDS) {
+        if !visited.insert(rel.clone()) {
+            continue;
+        }
+        let config = read_config(&root.join(&rel));
+        if let Ok(config) = &config {
+            let dir = parent_dir(&rel);
+            pending.extend(
+                config
+                    .extends
+                    .iter()
+                    .flat_map(|extends| relative_extends(extends, &dir)),
+            );
+        }
+        chain.push((rel, config));
+    }
+    chain
+}
+
+fn read_config(path: &Path) -> Result<TsConfig> {
+    let config_error = |message: String| Error::Config {
+        path: path.to_path_buf(),
+        message,
+    };
+    let src = std::fs::read_to_string(path).map_err(|e| config_error(e.to_string()))?;
+    serde_json::from_str(&strip_jsonc(&src)).map_err(|e| config_error(e.to_string()))
+}
+
+fn parent_dir(rel: &Path) -> PathBuf {
+    rel.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
 /// Workspace-relative files named by the relative entries of an `extends` string or array.
@@ -463,6 +496,39 @@ mod tests {
         );
         let paths = TsPaths::load(dir.path()).unwrap();
         assert_eq!(paths.resolve("@x"), vec![PathBuf::from("libs/x/index.ts")]);
+    }
+
+    #[test]
+    fn config_files_follow_every_root_config_leniently() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{ "extends": ["./configs/base", "@tsconfig/node20"] }"#,
+        );
+        write(
+            dir.path(),
+            "configs/base.json",
+            r#"{ "extends": "./strict.json", }"#,
+        );
+        write(dir.path(), "configs/strict.json", "{ not json");
+        write(
+            dir.path(),
+            "tsconfig.base.json",
+            r#"{ "extends": "./missing" }"#,
+        );
+        assert_eq!(
+            config_files(dir.path()),
+            [
+                "configs/base.json",
+                "configs/strict.json",
+                "missing.json",
+                "tsconfig.base.json",
+                "tsconfig.json"
+            ]
+            .map(PathBuf::from)
+        );
+        assert!(config_files(tempfile::tempdir().unwrap().path()).is_empty());
     }
 
     #[test]

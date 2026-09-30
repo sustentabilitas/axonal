@@ -22,7 +22,7 @@ use crate::{
     config::DepsUsage,
     error::{Error, Result},
     files::{self, Patterns, display_root},
-    graph::{Kind, Project, Target, TaskGraph, TaskId, Workspace},
+    graph::{Kind, Project, Target, TaskGraph, TaskId, Workspace, infer::ts},
 };
 
 const FILE_HASHES: &str = ".axonal/filehash.json";
@@ -672,25 +672,93 @@ struct TaskInputs<'a> {
 }
 
 /// Workspace files every Cargo project's tasks depend on, whatever their `inputs`.
-const CARGO_WORKSPACE_FILES: [&str; 6] = [
+const CARGO_WORKSPACE_FILES: [&str; 10] = [
     "Cargo.lock",
     "Cargo.toml",
     ".cargo/config.toml",
     ".cargo/config",
     "rust-toolchain.toml",
     "rust-toolchain",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "clippy.toml",
+    ".clippy.toml",
 ];
-/// Workspace files every JS project's tasks depend on, whatever their `inputs`.
-const JS_WORKSPACE_FILES: [&str; 4] = [
+/// Workspace files every JS project's tasks depend on, whatever their `inputs`, besides
+/// the root tsconfig chain and root files starting with [`JS_CONFIG_PREFIXES`].
+const JS_WORKSPACE_FILES: [&str; 6] = [
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
     "package.json",
     ".npmrc",
+    "biome.json",
+    "biome.jsonc",
+];
+const JS_CONFIG_PREFIXES: [&str; 4] = [
+    "eslint.config.",
+    ".eslintrc",
+    ".prettierrc",
+    "prettier.config.",
 ];
 
 /// `rel` names something other than a directory, gitignored or not.
 fn exists(root: &Path, rel: &Path) -> bool {
     fs::symlink_metadata(root.join(rel)).is_ok_and(|meta| !meta.is_dir())
+}
+
+/// Workspace files matching the `{workspace}/` globs, plus literal ones naming existing
+/// files even if gitignored. Sorted.
+fn workspace_matches(ws: &Workspace, patterns: &Patterns) -> Vec<PathBuf> {
+    if !patterns.has_workspace_globs() {
+        return Vec::new();
+    }
+    let literal = patterns
+        .workspace_literals()
+        .filter_map(|glob| files::normalize(Path::new(glob)))
+        .filter(|path| exists(&ws.root, path));
+    ws.files
+        .iter()
+        .filter(|f| patterns.matches_workspace(f))
+        .cloned()
+        .chain(literal)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Implicit inputs shared across projects, resolved once per run.
+struct WorkspaceInputs {
+    cargo: Vec<PathBuf>,
+    js: Vec<PathBuf>,
+    /// `[workspace] inputs`, hashed by every task.
+    every: Vec<PathBuf>,
+}
+
+impl WorkspaceInputs {
+    fn resolve(ws: &Workspace) -> Result<WorkspaceInputs> {
+        let js_configs = ws.files.iter().filter(|f| {
+            f.parent().is_some_and(|dir| dir.as_os_str().is_empty())
+                && f.to_str()
+                    .is_some_and(|name| JS_CONFIG_PREFIXES.iter().any(|p| name.starts_with(p)))
+        });
+        let globs: Vec<String> = ws
+            .config
+            .workspace
+            .inputs
+            .iter()
+            .map(|glob| format!("{}{glob}", files::WORKSPACE_PREFIX))
+            .collect();
+        Ok(WorkspaceInputs {
+            cargo: CARGO_WORKSPACE_FILES.iter().map(PathBuf::from).collect(),
+            js: JS_WORKSPACE_FILES
+                .iter()
+                .map(PathBuf::from)
+                .chain(ts::config_files(&ws.root))
+                .chain(js_configs.cloned())
+                .collect(),
+            every: workspace_matches(ws, &Patterns::new(&globs)?),
+        })
+    }
 }
 
 /// Per-run memos of everything tasks share: glob sets, the files matching an inputs list
@@ -702,6 +770,7 @@ struct Plan<'a> {
     owned: HashMap<(&'a str, &'a [String]), Rc<[PathBuf]>>,
     shared: HashMap<&'a [String], Rc<[PathBuf]>>,
     implicit: HashMap<&'a str, Rc<[PathBuf]>>,
+    workspace_inputs: Option<Rc<WorkspaceInputs>>,
     closures: HashMap<&'a str, Rc<[&'a str]>>,
     /// `(project, inputs)` pairs whose closure files are already in `owned`.
     prepared: HashSet<(&'a str, &'a [String])>,
@@ -726,6 +795,7 @@ impl<'a> Plan<'a> {
             owned: HashMap::new(),
             shared: HashMap::new(),
             implicit: HashMap::new(),
+            workspace_inputs: None,
             closures: HashMap::new(),
             prepared: HashSet::new(),
         }
@@ -786,40 +856,34 @@ impl<'a> Plan<'a> {
         let patterns = self.patterns(inputs)?;
         let ws = self.ws;
         memo(&mut self.shared, inputs, || {
-            if !patterns.has_workspace_globs() {
-                return Ok(Rc::from([]));
-            }
-            let literal = patterns
-                .workspace_literals()
-                .filter_map(|glob| files::normalize(Path::new(glob)))
-                .filter(|path| exists(&ws.root, path));
-            Ok(ws
-                .files
-                .iter()
-                .filter(|f| patterns.matches_workspace(f))
-                .cloned()
-                .chain(literal)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect())
+            Ok(workspace_matches(ws, &patterns).into())
         })
     }
 
-    /// Lockfiles, workspace manifests and toolchain files for the project's kinds (all of
-    /// them for explicit projects, which may run anything), plus its own manifests. No
+    fn workspace_inputs(&mut self) -> Result<Rc<WorkspaceInputs>> {
+        match &self.workspace_inputs {
+            Some(inputs) => Ok(inputs.clone()),
+            None => Ok(self
+                .workspace_inputs
+                .insert(Rc::new(WorkspaceInputs::resolve(self.ws)?))
+                .clone()),
+        }
+    }
+
+    /// Lockfiles, workspace manifests, toolchain files and tool configs for the project's
+    /// kinds (all of them for explicit projects, which may run anything), `[workspace]
+    /// inputs`, and the project's own manifests. No
     /// `inputs` list can drop these; missing ones hash as `missing`.
     fn implicit(&mut self, project: &'a Project) -> Result<Rc<[PathBuf]>> {
+        let workspace = self.workspace_inputs()?;
         memo(&mut self.implicit, project.name.as_str(), || {
             Ok({
                 let kinds = &project.kinds;
                 let uses = |kind: &Kind| kinds.contains(kind) || kinds.contains(&Kind::Explicit);
-                let workspace = [
-                    (Kind::Cargo, &CARGO_WORKSPACE_FILES[..]),
-                    (Kind::Js, &JS_WORKSPACE_FILES[..]),
-                ]
-                .into_iter()
-                .filter(|(kind, _)| uses(kind))
-                .flat_map(|(_, files)| files.iter().map(PathBuf::from));
+                let ecosystems = [(Kind::Cargo, &workspace.cargo), (Kind::Js, &workspace.js)]
+                    .into_iter()
+                    .filter(|(kind, _)| uses(kind))
+                    .flat_map(|(_, files)| files.iter().cloned());
                 let manifests = [(Kind::Js, "package.json"), (Kind::Cargo, "Cargo.toml")]
                     .into_iter()
                     .map(|(kind, name)| (kind, project.root.join(name)))
@@ -827,7 +891,8 @@ impl<'a> Plan<'a> {
                         kinds.contains(kind) || project.files.binary_search(path).is_ok()
                     })
                     .map(|(_, path)| path);
-                workspace
+                ecosystems
+                    .chain(workspace.every.iter().cloned())
                     .chain(manifests)
                     .collect::<BTreeSet<_>>()
                     .into_iter()
@@ -1865,6 +1930,98 @@ inputs = ["src/**"]
             r#"{"name":"p","version":"2.0.0","scripts":{"build":"tsc"}}"#,
         );
         assert_ne!(key_of(dir.path(), "build", "p"), before);
+    }
+
+    #[test]
+    fn root_js_tool_configs_change_pnpm_member_keys() {
+        let dir = mixed_workspace();
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{"extends":"./configs/base"}"#,
+        );
+        write(
+            dir.path(),
+            "configs/base.json",
+            r#"{"compilerOptions":{"strict":false}}"#,
+        );
+        let edits = [
+            (
+                "configs/base.json",
+                r#"{"compilerOptions":{"strict":true}}"#,
+            ),
+            ("tsconfig.base.json", "{}"),
+            ("eslint.config.js", "export default []"),
+            (".eslintrc.json", "{}"),
+            (".prettierrc", "{}"),
+            ("prettier.config.mjs", "export default {}"),
+            ("biome.json", "{}"),
+            ("biome.jsonc", "{}"),
+        ];
+        let c = key_of(dir.path(), "build", "c");
+        edits
+            .iter()
+            .fold(key_of(dir.path(), "build", "p"), |before, (file, body)| {
+                write(dir.path(), file, body);
+                let after = key_of(dir.path(), "build", "p");
+                assert_ne!(before, after, "{file}");
+                after
+            });
+        assert_eq!(
+            key_of(dir.path(), "build", "c"),
+            c,
+            "JS configs aren't Cargo inputs"
+        );
+    }
+
+    #[test]
+    fn root_rust_tool_configs_change_cargo_member_keys() {
+        let dir = mixed_workspace();
+        let p = key_of(dir.path(), "build", "p");
+        [
+            "rustfmt.toml",
+            ".rustfmt.toml",
+            "clippy.toml",
+            ".clippy.toml",
+        ]
+        .iter()
+        .fold(key_of(dir.path(), "build", "c"), |before, file| {
+            write(dir.path(), file, "max_width = 80\n");
+            let after = key_of(dir.path(), "build", "c");
+            assert_ne!(before, after, "{file}");
+            after
+        });
+        assert_eq!(
+            key_of(dir.path(), "build", "p"),
+            p,
+            "Rust configs aren't JS inputs"
+        );
+    }
+
+    #[test]
+    fn configured_workspace_inputs_change_every_key() {
+        let dir = fixture();
+        write(
+            dir.path(),
+            "axonal.toml",
+            &format!("[workspace]\ninputs = [\".tool-versions\", \"ci/*.env\"]\n{CONFIG}"),
+        );
+        write(dir.path(), ".gitignore", ".tool-versions\n");
+        write(dir.path(), ".tool-versions", "node 24");
+        write(dir.path(), "ci/prod.env", "A=1");
+        let every = || {
+            [("build", "libs/a"), ("build", "apps/b"), ("fmt", "apps/b")]
+                .map(|(target, project)| key_of(dir.path(), target, project))
+        };
+        let k0 = every();
+        write(dir.path(), ".tool-versions", "node 26");
+        let k1 = every();
+        write(dir.path(), "ci/prod.env", "A=2");
+        let k2 = every();
+        for i in 0..3 {
+            assert_ne!(k0[i], k1[i], "gitignored literal, key {i}");
+            assert_ne!(k1[i], k2[i], "glob, key {i}");
+        }
     }
 
     #[test]
