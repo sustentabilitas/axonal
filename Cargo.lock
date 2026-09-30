@@ -140,6 +140,7 @@ dependencies = [
  "globset",
  "ignore",
  "jev",
+ "libc",
  "oxc_allocator",
  "oxc_parser",
  "oxc_span",

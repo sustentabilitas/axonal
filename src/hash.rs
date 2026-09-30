@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,8 @@ const FILE_HASHES_VERSION: u32 = 2;
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 /// The digest of a path that doesn't exist.
 const MISSING: &str = "missing";
+/// The digest of a FIFO, socket or device, which is never opened.
+const SPECIAL: &str = "special";
 
 /// Content hashes keyed by UTF-8 path, reused across runs while a file's [`Stat`] is
 /// unchanged. Symlinks and non-UTF-8 paths are always hashed afresh.
@@ -124,12 +127,15 @@ impl FileHashCache {
             .unwrap_or_default()
     }
 
-    /// Writes the entries hashed since `load`, if anything changed.
+    /// Writes the entries, if anything changed, dropping those whose paths no longer
+    /// exist (entries for paths a filtered run didn't hash are kept).
     pub fn save(&self, root: &Path) -> Result<()> {
         let kept: BTreeMap<&String, &Stamp> = self
             .entries
-            .iter()
-            .filter(|(path, _)| self.seen.contains(*path))
+            .par_iter()
+            .filter(|(path, _)| {
+                self.seen.contains(*path) || fs::symlink_metadata(root.join(path)).is_ok()
+            })
             .collect();
         if !self.dirty && kept.len() == self.entries.len() {
             return Ok(());
@@ -150,25 +156,33 @@ impl FileHashCache {
     }
 
     /// The digest of `rel` (workspace-relative): its content and executable bit, a
-    /// symlink's text and target, or `missing`.
+    /// symlink's text and target (a directory's contents included), `special` for FIFOs,
+    /// sockets and devices, or `missing`.
     pub fn hash(&mut self, root: &Path, rel: &Path) -> Result<String> {
         let hashed = self.compute(root, rel)?;
         self.record(rel, hashed.stamp);
         Ok(hashed.digest)
     }
 
-    /// Digests of `paths`, hashed in parallel.
+    /// Digests of `paths`, hashed in parallel. If several fail, the error is the one for
+    /// the smallest path.
     fn hash_all<'p>(
         &mut self,
         root: &Path,
         paths: Vec<&'p Path>,
     ) -> Result<HashMap<&'p Path, String>> {
-        let hashed = paths
+        let (hashed, failed): (Vec<_>, Vec<_>) = paths
             .into_par_iter()
-            .map(|path| self.compute(root, path).map(|hashed| (path, hashed)))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|path| (path, self.compute(root, path)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .partition(|(_, hashed)| hashed.is_ok());
+        if let Some((_, Err(error))) = failed.into_iter().min_by_key(|(path, _)| *path) {
+            return Err(error);
+        }
         Ok(hashed
             .into_iter()
+            .filter_map(|(path, hashed)| hashed.ok().map(|hashed| (path, hashed)))
             .map(|(path, hashed)| {
                 self.record(path, hashed.stamp);
                 (path, hashed.digest)
@@ -188,10 +202,13 @@ impl FileHashCache {
             Ok(meta) => meta,
         };
         if meta.is_symlink() {
-            return symlink_digest(&path, rel).map(uncached);
+            return symlink_digest(&path, rel, Follow::Directories).map(uncached);
         }
         if meta.is_dir() {
             return Ok(uncached("dir".into()));
+        }
+        if !meta.is_file() {
+            return Ok(uncached(SPECIAL.into()));
         }
         let stat = Stat::of(&meta);
         let cached = rel
@@ -234,9 +251,17 @@ fn input_error(rel: &Path, source: io::Error) -> Error {
     }
 }
 
+/// Opened non-blocking on Unix, so a file swapped for a FIFO after its stat can't hang.
 fn content_hash(path: &Path) -> io::Result<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
     let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(fs::File::open(path)?)?;
+    hasher.update_reader(options.open(path)?)?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -254,23 +279,98 @@ fn file_digest(meta: &Metadata, content: &str) -> String {
     format!("file:{}:{content}", if executable { "x" } else { "-" })
 }
 
-/// The link text plus what it resolves to: a file's digest, `dir`, or `dangling` (which
-/// covers loops too).
-fn symlink_digest(path: &Path, rel: &Path) -> Result<String> {
+/// Whether a symlink to a directory folds in the directory's contents.
+#[derive(Clone, Copy)]
+enum Follow {
+    Directories,
+    /// For links met inside a followed directory, so link loops can't recurse.
+    Nothing,
+}
+
+/// Directories a followed directory link never descends into.
+const UNWALKED_DIRS: [&str; 2] = [".git", "node_modules"];
+
+/// The link text plus what it resolves to: a file's digest, a directory's contents (or
+/// just `dir`), `special`, or `dangling` (which covers loops too).
+fn symlink_digest(path: &Path, rel: &Path, follow: Follow) -> Result<String> {
     let link = fs::read_link(path).map_err(|e| input_error(rel, e))?;
-    let target = match fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => "dir".to_string(),
-        Ok(meta) => match content_hash(path) {
+    let target = match (fs::metadata(path), follow) {
+        (Ok(meta), Follow::Directories) if meta.is_dir() => dir_digest(path, rel)?,
+        (Ok(meta), Follow::Nothing) if meta.is_dir() => "dir".into(),
+        (Ok(meta), _) if !meta.is_file() => SPECIAL.into(),
+        (Ok(meta), _) => match content_hash(path) {
             Ok(content) => file_digest(&meta, &content),
             Err(e) if e.kind() == io::ErrorKind::NotFound => "dangling".into(),
             Err(e) => return Err(input_error(rel, e)),
         },
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(input_error(rel, e)),
-        Err(_) => "dangling".into(),
+        (Err(e), _) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Err(input_error(rel, e));
+        }
+        (Err(_), _) => "dangling".into(),
     };
     let mut fields = Fields::new();
     fields.add("link", path_bytes(&link)).add("target", target);
     Ok(format!("link:{}", fields.finish()))
+}
+
+/// Every entry under the directory `link` resolves to, sorted by relative path. Nested
+/// links aren't followed into directories, and `.git` and `node_modules` are skipped.
+fn dir_digest(link: &Path, rel: &Path) -> Result<String> {
+    let base = fs::canonicalize(link).map_err(|e| input_error(rel, e))?;
+    let walk_error = |e: ignore::Error| input_error(rel, io::Error::other(e));
+    let mut entries = WalkBuilder::new(&base)
+        .standard_filters(false)
+        .follow_links(false)
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !(e.file_type().is_some_and(|t| t.is_dir())
+                    && e.file_name()
+                        .to_str()
+                        .is_some_and(|n| UNWALKED_DIRS.contains(&n)))
+        })
+        .build()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .map_or(true, |e| !e.file_type().is_some_and(|t| t.is_dir()))
+        })
+        .map(|entry| {
+            let path = entry.map_err(walk_error)?.into_path();
+            let inner = path
+                .strip_prefix(&base)
+                .expect("walk stays under base")
+                .to_path_buf();
+            let digest = entry_digest(&path, &rel.join(&inner))?;
+            Ok((inner, digest))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort();
+    let mut fields = Fields::new();
+    entries.iter().for_each(|(inner, digest)| {
+        fields.add(path_bytes(inner), digest);
+    });
+    Ok(format!("dir:{}", fields.finish()))
+}
+
+/// A path inside a followed directory: a file's digest, a link's digest (never followed
+/// into directories), `special`, or `missing` if it vanished mid-walk.
+fn entry_digest(path: &Path, rel: &Path) -> Result<String> {
+    let meta = match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MISSING.into()),
+        Err(e) => return Err(input_error(rel, e)),
+        Ok(meta) => meta,
+    };
+    if meta.is_symlink() {
+        return symlink_digest(path, rel, Follow::Nothing);
+    }
+    if !meta.is_file() {
+        return Ok(SPECIAL.into());
+    }
+    match content_hash(path) {
+        Ok(content) => Ok(file_digest(&meta, &content)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(MISSING.into()),
+        Err(e) => Err(input_error(rel, e)),
+    }
 }
 
 fn is_racy(meta: &Metadata) -> bool {
@@ -552,8 +652,10 @@ fn path_bytes(path: &Path) -> &[u8] {
 }
 
 /// Owned files matching the target's project globs, plus any workspace file matching its
-/// `{workspace}/` globs, plus literal globs naming existing (even gitignored) files, minus
-/// the project's outputs. Excludes implicit inputs. Workspace-relative and sorted.
+/// `{workspace}/` globs, plus literal globs naming existing (even gitignored) files.
+/// Declared outputs stay inputs: ignored ones are already absent from the file list, and
+/// the rest are committed (codegen) or fixed in place. Excludes implicit inputs.
+/// Workspace-relative and sorted.
 pub fn input_files(ws: &Workspace, project: &Project, target: &Target) -> Result<Vec<PathBuf>> {
     Plan::new(ws).own_inputs(project, &target.inputs)
 }
@@ -591,13 +693,12 @@ fn exists(root: &Path, rel: &Path) -> bool {
     fs::symlink_metadata(root.join(rel)).is_ok_and(|meta| !meta.is_dir())
 }
 
-/// Per-run memos of everything tasks share: glob sets, each project's outputs, the files
-/// matching an inputs list in a project, workspace matches, implicit inputs and
+/// Per-run memos of everything tasks share: glob sets, the files matching an inputs list
+/// in a project, workspace matches, implicit inputs and
 /// dependency closures.
 struct Plan<'a> {
     ws: &'a Workspace,
     patterns: HashMap<&'a [String], Rc<Patterns>>,
-    outputs: HashMap<&'a str, Rc<Patterns>>,
     owned: HashMap<(&'a str, &'a [String]), Rc<[PathBuf]>>,
     shared: HashMap<&'a [String], Rc<[PathBuf]>>,
     implicit: HashMap<&'a str, Rc<[PathBuf]>>,
@@ -622,7 +723,6 @@ impl<'a> Plan<'a> {
         Plan {
             ws,
             patterns: HashMap::new(),
-            outputs: HashMap::new(),
             owned: HashMap::new(),
             shared: HashMap::new(),
             implicit: HashMap::new(),
@@ -652,24 +752,11 @@ impl<'a> Plan<'a> {
         })
     }
 
-    /// The union of every target's `outputs` in `project`.
-    fn outputs(&mut self, project: &'a Project) -> Result<Rc<Patterns>> {
-        memo(&mut self.outputs, project.name.as_str(), || {
-            let globs: Vec<String> = project
-                .targets
-                .values()
-                .flat_map(|t| t.outputs.iter().cloned())
-                .collect();
-            Patterns::new(&globs).map(Rc::new)
-        })
-    }
-
     /// Files `project` owns that match the project-relative globs, plus literal globs
-    /// naming existing files even if gitignored, minus the project's outputs. Only owned
-    /// files, so a project at the workspace root never sees its nested projects' files.
+    /// naming existing files even if gitignored. Only owned files, so a project at the
+    /// workspace root never sees its nested projects' files.
     fn owned(&mut self, project: &'a Project, inputs: &'a [String]) -> Result<Rc<[PathBuf]>> {
         let patterns = self.patterns(inputs)?;
-        let outputs = self.outputs(project)?;
         let ws = self.ws;
         memo(&mut self.owned, (project.name.as_str(), inputs), || {
             let root = &project.root;
@@ -687,11 +774,6 @@ impl<'a> Plan<'a> {
                 .filter(|path| exists(&ws.root, path));
             Ok(globbed
                 .chain(literal)
-                .filter(|f| {
-                    !(f.strip_prefix(root)
-                        .is_ok_and(|rel| outputs.matches_project(rel))
-                        || outputs.matches_workspace(f))
-                })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect())
@@ -726,10 +808,9 @@ impl<'a> Plan<'a> {
     /// Lockfiles, workspace manifests and toolchain files for the project's kinds (all of
     /// them for explicit projects, which may run anything), plus its own manifests. No
     /// `inputs` list can drop these; missing ones hash as `missing`.
-    fn implicit(&mut self, project: &'a Project) -> Rc<[PathBuf]> {
-        self.implicit
-            .entry(project.name.as_str())
-            .or_insert_with(|| {
+    fn implicit(&mut self, project: &'a Project) -> Result<Rc<[PathBuf]>> {
+        memo(&mut self.implicit, project.name.as_str(), || {
+            Ok({
                 let kinds = &project.kinds;
                 let uses = |kind: &Kind| kinds.contains(kind) || kinds.contains(&Kind::Explicit);
                 let workspace = [
@@ -752,7 +833,7 @@ impl<'a> Plan<'a> {
                     .into_iter()
                     .collect()
             })
-            .clone()
+        })
     }
 
     fn closure(&mut self, name: &'a str) -> Rc<[&'a str]> {
@@ -789,7 +870,7 @@ impl<'a> Plan<'a> {
             .flat_map(|names| names.iter())
             .try_for_each(|dep| {
                 let dep = &ws.projects[*dep];
-                self.implicit(dep);
+                self.implicit(dep)?;
                 self.owned(dep, &target.inputs).map(drop)
             })?;
         Ok(TaskInputs {
@@ -797,7 +878,7 @@ impl<'a> Plan<'a> {
             project,
             target,
             own: self.own_inputs(project, &target.inputs)?,
-            implicit: self.implicit(project),
+            implicit: self.implicit(project)?,
             closure,
         })
     }
@@ -1275,7 +1356,7 @@ command = "make a"
     }
 
     #[test]
-    fn unseen_entries_are_pruned_on_save() {
+    fn only_entries_for_vanished_paths_are_pruned() {
         let dir = tempfile::tempdir().unwrap();
         for f in ["a.txt", "b.txt"] {
             write(dir.path(), f, f);
@@ -1285,11 +1366,56 @@ command = "make a"
         cache.hash(dir.path(), Path::new("a.txt")).unwrap();
         cache.hash(dir.path(), Path::new("b.txt")).unwrap();
         cache.save(dir.path()).unwrap();
-        let mut second = FileHashCache::load(dir.path());
-        second.hash(dir.path(), Path::new("a.txt")).unwrap();
-        second.save(dir.path()).unwrap();
-        let third = FileHashCache::load(dir.path());
-        assert_eq!(third.entries.keys().collect::<Vec<_>>(), ["a.txt"]);
+        let entries = || {
+            FileHashCache::load(dir.path())
+                .entries
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+
+        let mut filtered = FileHashCache::load(dir.path());
+        filtered.hash(dir.path(), Path::new("a.txt")).unwrap();
+        filtered.save(dir.path()).unwrap();
+        assert_eq!(entries(), ["a.txt", "b.txt"], "a filtered run keeps b");
+
+        fs::remove_file(dir.path().join("b.txt")).unwrap();
+        let mut after_delete = FileHashCache::load(dir.path());
+        after_delete.hash(dir.path(), Path::new("a.txt")).unwrap();
+        after_delete.save(dir.path()).unwrap();
+        assert_eq!(entries(), ["a.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_smallest_failing_path_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.\"libs/a\".targets.build]\ncommand = \"make\"\n",
+        );
+        let names: Vec<String> = (0..16).map(|i| format!("libs/a/f{i:02}.txt")).collect();
+        names.iter().for_each(|f| write(dir.path(), f, f));
+        let ws = Workspace::discover(dir.path()).unwrap();
+        names.iter().rev().for_each(|f| {
+            fs::set_permissions(dir.path().join(f), fs::Permissions::from_mode(0o000)).unwrap()
+        });
+        if fs::read(dir.path().join(&names[0])).is_ok() {
+            return; // running as root
+        }
+        let graph = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        for _ in 0..5 {
+            let err = task_keys(
+                &ws,
+                &graph,
+                &mut FileHashCache::default(),
+                &Toolchain::default(),
+                &no_env,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("libs/a/f00.txt"), "{err}");
+        }
     }
 
     #[cfg(unix)]
@@ -1311,30 +1437,324 @@ command = "make a"
     }
 
     #[test]
-    fn declared_outputs_do_not_change_keys() {
+    fn committed_outputs_are_still_inputs() {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
             "axonal.toml",
-            &format!(
-                "{ONE}\n[projects.\"apps/b\"]\ndeps = [\"libs/a\"]\n\n[projects.\"apps/b\".targets.build]\ncommand = \"make\"\n"
-            ),
+            r#"
+[projects."libs/a".targets.build]
+command = "tsc"
+
+[projects."libs/a".targets.codegen]
+command = "gen"
+outputs = ["src/gen/**"]
+
+[projects."libs/a".targets."lint-fix"]
+command = "eslint --fix ."
+outputs = ["src/**"]
+
+[projects."apps/b"]
+deps = ["libs/a"]
+
+[projects."apps/b".targets.build]
+command = "tsc"
+"#,
         );
-        write(dir.path(), "libs/a/src/a.txt", "a");
-        write(dir.path(), "apps/b/src/b.txt", "b");
-        let before = (
-            key_of(dir.path(), "build", "libs/a"),
-            key_of(dir.path(), "build", "apps/b"),
-        );
-        write(dir.path(), "libs/a/out/bundle.js", "built at 12:00");
-        let after = (
-            key_of(dir.path(), "build", "libs/a"),
-            key_of(dir.path(), "build", "apps/b"),
-        );
+        write(dir.path(), "libs/a/src/main.ts", "1");
+        write(dir.path(), "libs/a/src/gen/api.ts", "1");
+        write(dir.path(), "apps/b/src/b.ts", "b");
+        let keys = || {
+            ["build", "lint-fix"]
+                .map(|t| key_of(dir.path(), t, "libs/a"))
+                .into_iter()
+                .chain([key_of(dir.path(), "build", "apps/b")])
+                .collect::<Vec<_>>()
+        };
+        let k0 = keys();
+        write(dir.path(), "libs/a/src/gen/api.ts", "hand edit");
+        let k1 = keys();
+        write(dir.path(), "libs/a/src/main.ts", "2");
+        let k2 = keys();
+        for i in 0..3 {
+            assert_ne!(k0[i], k1[i], "editing src/gen/api.ts changes key {i}");
+            assert_ne!(k1[i], k2[i], "editing src/main.ts changes key {i}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_inside_symlinked_directories_change_keys() {
+        use std::os::unix::fs::symlink;
+        let dir = one_project();
+        write(dir.path(), "shared/util.ts", "export const x = 1");
+        write(dir.path(), "shared/node_modules/dep/index.js", "1");
+        symlink(".", dir.path().join("shared/loop")).unwrap();
+        symlink("../../../shared", dir.path().join("libs/a/src/shared")).unwrap();
+        let before = key_of(dir.path(), "build", "libs/a");
+        write(dir.path(), "shared/node_modules/dep/index.js", "2");
         assert_eq!(
-            before, after,
-            "outputs are not inputs, here or in dependents"
+            key_of(dir.path(), "build", "libs/a"),
+            before,
+            "node_modules is skipped"
         );
+        write(dir.path(), "shared/util.ts", "export const x = 2");
+        let edited = key_of(dir.path(), "build", "libs/a");
+        assert_ne!(edited, before);
+        write(dir.path(), "shared/nested/new.ts", "");
+        assert_ne!(key_of(dir.path(), "build", "libs/a"), edited);
+    }
+
+    /// Runs `f` on a thread; true if it hasn't finished after 1.5 s, in which case
+    /// `unblock` runs so `f` can finish.
+    #[cfg(unix)]
+    fn hangs(f: impl FnOnce() + Send + 'static, unblock: impl FnOnce()) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        let hung = rx.recv_timeout(Duration::from_millis(1500)).is_err();
+        if hung {
+            unblock();
+        }
+        hung
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_inputs_hash_as_special_without_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(
+            &root,
+            "axonal.toml",
+            "[projects.\"libs/a\".targets.build]\ncommand = \"m\"\ninputs = [\"src/**\", \"pipe\", \"via-link\"]\n",
+        );
+        write(&root, "libs/a/src/a.txt", "a");
+        let fifo = root.join("libs/a/pipe");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::os::unix::fs::symlink("pipe", root.join("libs/a/via-link")).unwrap();
+        let r = root.clone();
+        let hung = hangs(
+            move || {
+                key_of(&r, "build", "libs/a");
+            },
+            || {
+                let _ = fs::OpenOptions::new().write(true).open(&fifo);
+            },
+        );
+        assert!(!hung, "hashing a FIFO must not block");
+        let mut cache = FileHashCache::default();
+        assert_eq!(
+            cache.hash(&root, Path::new("libs/a/pipe")).unwrap(),
+            SPECIAL
+        );
+        assert_ne!(
+            cache.hash(&root, Path::new("libs/a/via-link")).unwrap(),
+            MISSING
+        );
+    }
+
+    fn all_keys(ws: &Workspace, graph: &TaskGraph) -> BTreeMap<TaskId, Key> {
+        task_keys(
+            ws,
+            graph,
+            &mut FileHashCache::default(),
+            &Toolchain::default(),
+            &no_env,
+        )
+        .unwrap()
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    const TARGETS: [&str; 4] = ["build", "test", "lint", "fmt"];
+
+    /// `n` explicit projects with random deps and targets, outputs, gitignored literal
+    /// inputs and a `{workspace}/` input.
+    fn random_workspace(n: usize, seed: u64) -> tempfile::TempDir {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rng = Lcg(seed);
+        let mut config = String::from(
+            r#"
+[targets.build]
+depends_on = ["^build"]
+outputs = ["dist/**"]
+
+[targets.test]
+inputs = ["src/**", "test/**", ".env.local"]
+
+[targets.lint]
+inputs = ["src/**", "{workspace}/eslint.cfg"]
+
+[targets.fmt]
+inputs = ["src/**"]
+"#,
+        );
+        for i in 0..n {
+            let deps: Vec<String> = (0..i)
+                .filter(|_| rng.next().is_multiple_of(5))
+                .map(|d| format!("\"p{d:02}\""))
+                .collect();
+            writeln!(config, "[projects.p{i:02}]\ndeps = [{}]\n", deps.join(", ")).unwrap();
+            for t in TARGETS {
+                if t == "build" || !rng.next().is_multiple_of(3) {
+                    writeln!(
+                        config,
+                        "[projects.p{i:02}.targets.{t}]\ncommand = \"{t} {i}\"\n"
+                    )
+                    .unwrap();
+                }
+            }
+            write(dir.path(), &format!("p{i:02}/src/m.ts"), &format!("{i}"));
+            if rng.next().is_multiple_of(2) {
+                write(dir.path(), &format!("p{i:02}/test/t.ts"), "t");
+            }
+            write(dir.path(), &format!("p{i:02}/README.md"), "r");
+            write(dir.path(), &format!("p{i:02}/dist/out.js"), "o");
+            if rng.next().is_multiple_of(4) {
+                write(dir.path(), &format!("p{i:02}/.env.local"), "e");
+            }
+        }
+        write(dir.path(), ".gitignore", ".env.local\n");
+        write(dir.path(), "eslint.cfg", "rules");
+        write(dir.path(), "pnpm-lock.yaml", "l");
+        write(dir.path(), "axonal.toml", &config);
+        dir
+    }
+
+    fn every_target(ws: &Workspace) -> TaskGraph {
+        TaskGraph::build(ws, &TARGETS.map(String::from), None).unwrap()
+    }
+
+    #[test]
+    fn memo_single_root_graphs_match_full_graph() {
+        for seed in 1..=5 {
+            let dir = random_workspace(30, seed);
+            let ws = Workspace::discover(dir.path()).unwrap();
+            let graph = every_target(&ws);
+            let full = all_keys(&ws, &graph);
+            for id in &graph.order {
+                let single = TaskGraph::from_roots(&ws, vec![id.clone()]).unwrap();
+                assert_eq!(all_keys(&ws, &single)[id], full[id], "seed {seed} {id}");
+            }
+        }
+    }
+
+    /// The files a task's key should cover, computed per task with fresh memos.
+    fn reference_files(ws: &Workspace, id: &TaskId) -> BTreeSet<PathBuf> {
+        let project = &ws.projects[&id.project];
+        let target = ws.target(id);
+        let mut plan = Plan::new(ws);
+        let own = plan.own_inputs(project, &target.inputs).unwrap();
+        let implicit = plan.implicit(project).unwrap();
+        let deps = (target.deps_usage != DepsUsage::None)
+            .then(|| ws.dependency_closure(&project.name))
+            .into_iter()
+            .flatten()
+            .flat_map(|dep| {
+                let dep = &ws.projects[dep];
+                let mut fresh = Plan::new(ws);
+                let owned = fresh.owned(dep, &target.inputs).unwrap();
+                let implicit = fresh.implicit(dep).unwrap();
+                owned
+                    .iter()
+                    .chain(implicit.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+        own.into_iter()
+            .chain(implicit.iter().cloned())
+            .chain(deps)
+            .collect()
+    }
+
+    #[test]
+    fn memo_file_edits_change_exactly_the_expected_keys_seed_7() {
+        file_edits_change_exactly_the_expected_keys(7);
+    }
+
+    #[test]
+    fn memo_file_edits_change_exactly_the_expected_keys_seed_8() {
+        file_edits_change_exactly_the_expected_keys(8);
+    }
+
+    fn file_edits_change_exactly_the_expected_keys(seed: u64) {
+        let dir = random_workspace(25, seed);
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let graph = every_target(&ws);
+        let base = all_keys(&ws, &graph);
+        let refs: BTreeMap<&TaskId, BTreeSet<PathBuf>> = graph
+            .order
+            .iter()
+            .map(|id| (id, reference_files(&ws, id)))
+            .collect();
+        let candidates: BTreeSet<PathBuf> = ws
+            .files
+            .iter()
+            .cloned()
+            .chain(refs.values().flatten().cloned())
+            .filter(|f| dir.path().join(f).is_file())
+            .collect();
+        for file in &candidates {
+            let abs = dir.path().join(file);
+            let original = fs::read(&abs).unwrap();
+            fs::write(&abs, [original.as_slice(), b"!"].concat()).unwrap();
+            let edited = all_keys(&ws, &graph);
+            fs::write(&abs, &original).unwrap();
+            let expected = graph.order.iter().fold(BTreeSet::new(), |mut hit, id| {
+                if refs[id].contains(file) || graph.deps[id].iter().any(|d| hit.contains(d)) {
+                    hit.insert(id);
+                }
+                hit
+            });
+            let changed: BTreeSet<&TaskId> = graph
+                .order
+                .iter()
+                .filter(|id| base[*id] != edited[*id])
+                .collect();
+            assert_eq!(changed, expected, "seed {seed} file {}", file.display());
+        }
+        assert!(candidates.len() > 50, "{}", candidates.len());
+        assert_eq!(all_keys(&ws, &graph), base);
+    }
+
+    #[test]
+    fn keys_do_not_depend_on_the_thread_count() {
+        let dir = random_workspace(40, 11);
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let graph = every_target(&ws);
+        let with = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| all_keys(&ws, &graph))
+        };
+        let one = with(1);
+        for threads in [2, 8, 16] {
+            for _ in 0..5 {
+                assert_eq!(with(threads), one, "{threads} threads");
+            }
+        }
     }
 
     #[test]
