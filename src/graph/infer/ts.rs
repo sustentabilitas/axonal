@@ -222,6 +222,11 @@ pub fn is_source(path: &Path) -> bool {
 pub fn specifiers(path: &Path, src: &str) -> Vec<String> {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::tsx());
+    let source_type = if source_type.is_javascript() {
+        source_type.with_jsx(true)
+    } else {
+        source_type
+    };
     let parsed = Parser::new(&allocator, src, source_type).parse();
     let record = &parsed.module_record;
     let dynamic = record.dynamic_imports.iter().filter_map(|d| {
@@ -230,7 +235,8 @@ pub fn specifiers(path: &Path, src: &str) -> Vec<String> {
         let quoted = bytes.len() >= 2
             && matches!(bytes[0], b'"' | b'\'' | b'`')
             && bytes[0] == bytes[bytes.len() - 1];
-        (quoted && !text.contains("${")).then(|| text[1..text.len() - 1].to_string())
+        let inner = quoted.then(|| &text[1..text.len() - 1])?;
+        (!inner.contains(char::from(bytes[0])) && !inner.contains("${")).then(|| inner.to_string())
     });
     record
         .requested_modules
@@ -283,7 +289,7 @@ fn resolve(
     paths
         .resolve(spec)
         .iter()
-        .filter(|p| !p.starts_with("node_modules") && exists(p, workspace))
+        .filter(|p| exists(p, workspace))
         .filter_map(|p| owner(p.as_path()))
         .chain(packages.get(package_name(spec)).cloned())
         .collect()
@@ -311,8 +317,8 @@ pub fn import_edges(
     sources
         .into_par_iter()
         .flat_map_iter(|(project, file)| {
-            let src = std::fs::read_to_string(root.join(file)).unwrap_or_default();
-            specifiers(file, &src)
+            let bytes = std::fs::read(root.join(file)).unwrap_or_default();
+            specifiers(file, &String::from_utf8_lossy(&bytes))
                 .iter()
                 .flat_map(|spec| resolve(spec, file, owners, packages, paths, &workspace))
                 .filter(|dep| dep != project)
@@ -531,6 +537,8 @@ export { b } from "@acme/b";
 const lazy = () => import("./lazy");
 const dynamic = (x: string) => import(x);
 const tpl = () => import(`./tpl`);
+const joined = () => import('../x/' + 'y');
+const glued = () => import("a" + "b");
 "#;
         let mut specs = specifiers(Path::new("src/index.ts"), src);
         specs.sort();
@@ -551,6 +559,14 @@ const tpl = () => import(`./tpl`);
     fn parses_jsx_in_tsx_files() {
         let src = "import { B } from '@acme/ui';\nexport const A = () => <B />;\n";
         assert_eq!(specifiers(Path::new("a.tsx"), src), ["@acme/ui"]);
+    }
+
+    #[test]
+    fn parses_jsx_in_js_files() {
+        let src = "import '@acme/ui';\nconst A = () => <B />;\nimport z from '@acme/late';\n";
+        let mut specs = specifiers(Path::new("a.js"), src);
+        specs.sort();
+        assert_eq!(specs, ["@acme/late", "@acme/ui"]);
     }
 
     #[test]
