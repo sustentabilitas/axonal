@@ -151,6 +151,10 @@ impl Patterns {
         self.workspace.is_match(path)
     }
 
+    pub fn has_workspace_globs(&self) -> bool {
+        !self.workspace_globs.is_empty()
+    }
+
     /// Existing files matching these globs, found by walking each glob's literal base
     /// directory without gitignore filtering (outputs are usually ignored).
     /// Workspace-relative and sorted.
@@ -315,6 +319,12 @@ mod tests {
         assert!(!p.matches_project(Path::new("test/a.ts")));
         assert!(p.matches_workspace(Path::new("pnpm-lock.yaml")));
         assert!(!p.matches_workspace(Path::new("src/a.ts")));
+        assert!(p.has_workspace_globs());
+        assert!(
+            !Patterns::new(&["src/**".into()])
+                .unwrap()
+                .has_workspace_globs()
+        );
     }
 
     #[test]

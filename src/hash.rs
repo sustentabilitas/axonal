@@ -2,16 +2,19 @@
 //! dependency projects, env, dependency task keys and toolchain versions.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map},
     ffi::OsString,
     fmt,
     fs::{self, Metadata},
+    hash::Hash,
     io,
     path::{Path, PathBuf},
     process::Command,
+    rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -152,6 +155,25 @@ impl FileHashCache {
         let hashed = self.compute(root, rel)?;
         self.record(rel, hashed.stamp);
         Ok(hashed.digest)
+    }
+
+    /// Digests of `paths`, hashed in parallel.
+    fn hash_all<'p>(
+        &mut self,
+        root: &Path,
+        paths: Vec<&'p Path>,
+    ) -> Result<HashMap<&'p Path, String>> {
+        let hashed = paths
+            .into_par_iter()
+            .map(|path| self.compute(root, path).map(|hashed| (path, hashed)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(hashed
+            .into_iter()
+            .map(|(path, hashed)| {
+                self.record(path, hashed.stamp);
+                (path, hashed.digest)
+            })
+            .collect())
     }
 
     fn compute(&self, root: &Path, rel: &Path) -> Result<Hashed> {
@@ -325,30 +347,74 @@ pub fn task_keys(
     tools: &Toolchain,
     env: Env<'_>,
 ) -> Result<BTreeMap<TaskId, Key>> {
-    graph
+    let mut plan = Plan::with_closures(
+        ws,
+        graph
+            .order
+            .iter()
+            .filter(|id| ws.target(id).deps_usage != DepsUsage::None)
+            .map(|id| id.project.as_str())
+            .collect(),
+    );
+    let tasks = graph
         .order
         .iter()
-        .try_fold(BTreeMap::new(), |mut keys, id| {
-            let key = hash_task(ws, id, &graph.deps[id], &keys, files, tools, env)?;
-            keys.insert(id.clone(), key);
-            Ok(keys)
-        })
+        .map(|id| plan.task(id))
+        .collect::<Result<Vec<_>>>()?;
+    let digests = files.hash_all(&ws.root, plan.files())?;
+    let mut dep_digests: HashMap<&[String], HashMap<&str, blake3::Hash>> = HashMap::new();
+    let mut closure_digests = HashMap::new();
+    Ok(tasks.iter().fold(BTreeMap::new(), |mut keys, task| {
+        let inputs = task.target.inputs.as_slice();
+        let closure = task.closure.as_ref().map(|names| {
+            *closure_digests
+                .entry((task.project.name.as_str(), inputs))
+                .or_insert_with(|| {
+                    let mut fields = Fields::new();
+                    let dep_digests = dep_digests.entry(inputs).or_default();
+                    names.iter().for_each(|dep| {
+                        let digest = dep_digests
+                            .entry(*dep)
+                            .or_insert_with(|| plan.dep_digest(dep, inputs, &digests));
+                        fields
+                            .add("dep_project", dep)
+                            .add("dep_inputs", digest.as_bytes());
+                    });
+                    fields.hash()
+                })
+        });
+        let key = hash_task(
+            task,
+            closure,
+            &graph.deps[task.id],
+            &keys,
+            &digests,
+            tools,
+            env,
+        );
+        keys.insert(task.id.clone(), key);
+        keys
+    }))
 }
 
 fn hash_task(
-    ws: &Workspace,
-    id: &TaskId,
+    task: &TaskInputs<'_>,
+    closure: Option<blake3::Hash>,
     deps: &BTreeSet<TaskId>,
     keys: &BTreeMap<TaskId, Key>,
-    files: &mut FileHashCache,
+    digests: &HashMap<&Path, String>,
     tools: &Toolchain,
     env: Env<'_>,
-) -> Result<Key> {
-    let project = &ws.projects[&id.project];
-    let target = ws.target(id);
+) -> Key {
+    let TaskInputs {
+        id,
+        project,
+        target,
+        ..
+    } = *task;
     let mut fields = Fields::new();
     fields
-        .add("format", "axonal-task-v1")
+        .add("format", "axonal-task-v2")
         .add("project", &project.name)
         .add("root", display_root(&project.root))
         .add("target", &id.target)
@@ -356,22 +422,13 @@ fn hash_task(
             "config",
             serde_json::to_string(target).expect("targets serialize"),
         );
-    for path in input_files(ws, project, target)? {
-        let hash = files.hash(&ws.root, &path)?;
-        fields.add("input", path_bytes(&path)).add("content", hash);
+    for path in &task.own {
+        fields
+            .add("input", path_bytes(path))
+            .add("content", &digests[path.as_path()]);
     }
-    if target.deps_usage != DepsUsage::None {
-        let patterns = Patterns::new(&target.inputs)?;
-        for name in ws.dependency_closure(&project.name) {
-            let dep = &ws.projects[name];
-            fields.add("dep_project", name);
-            for path in owned_matches(dep, &patterns) {
-                let hash = files.hash(&ws.root, path)?;
-                fields
-                    .add("dep_input", path_bytes(path))
-                    .add("content", hash);
-            }
-        }
+    if let Some(closure) = closure {
+        fields.add("dependency_closure", closure.as_bytes());
     }
     for var in target.env.iter().collect::<BTreeSet<_>>() {
         fields.add("env", var);
@@ -389,7 +446,7 @@ fn hash_task(
     fields
         .add("os", std::env::consts::OS)
         .add("arch", std::env::consts::ARCH);
-    Ok(Key(fields.finish()))
+    Key(fields.finish())
 }
 
 /// Length-prefixed fields, so no two different field lists hash the same bytes.
@@ -408,8 +465,12 @@ impl Fields {
         self
     }
 
+    fn hash(&self) -> blake3::Hash {
+        self.0.finalize()
+    }
+
     fn finish(&self) -> String {
-        self.0.finalize().to_hex().to_string()
+        self.hash().to_hex().to_string()
     }
 }
 
@@ -418,29 +479,180 @@ fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()
 }
 
-/// Files `project` owns that match the project-relative globs. Only owned files, so a
-/// project at the workspace root never sees its nested projects' files.
-fn owned_matches<'a>(
-    project: &'a Project,
-    patterns: &'a Patterns,
-) -> impl Iterator<Item = &'a PathBuf> {
-    project.files.iter().filter(|f| {
-        f.strip_prefix(&project.root)
-            .is_ok_and(|rel| patterns.matches_project(rel))
-    })
-}
-
 /// Owned files matching the target's project globs, plus any workspace file matching its
 /// `{workspace}/` globs. Workspace-relative and sorted.
 pub fn input_files(ws: &Workspace, project: &Project, target: &Target) -> Result<Vec<PathBuf>> {
-    let patterns = Patterns::new(&target.inputs)?;
-    let shared = ws.files.iter().filter(|f| patterns.matches_workspace(f));
-    Ok(owned_matches(project, &patterns)
-        .chain(shared)
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
+    Plan::new(ws).own_inputs(project, &target.inputs)
+}
+
+/// What one task's key covers, resolved before any file is hashed.
+struct TaskInputs<'a> {
+    id: &'a TaskId,
+    project: &'a Project,
+    target: &'a Target,
+    own: Vec<PathBuf>,
+    /// The dependency closure, unless `deps_usage = none`.
+    closure: Option<Rc<[&'a str]>>,
+}
+
+/// Per-run memos of everything tasks share: glob sets, the files matching an inputs
+/// list in a project, workspace matches and dependency closures.
+struct Plan<'a> {
+    ws: &'a Workspace,
+    patterns: HashMap<&'a [String], Rc<Patterns>>,
+    owned: HashMap<(&'a str, &'a [String]), Rc<[PathBuf]>>,
+    shared: HashMap<&'a [String], Rc<[PathBuf]>>,
+    closures: HashMap<&'a str, Rc<[&'a str]>>,
+    /// `(project, inputs)` pairs whose closure files are already in `owned`.
+    prepared: HashSet<(&'a str, &'a [String])>,
+}
+
+fn memo<K: Eq + Hash, V: Clone>(
+    map: &mut HashMap<K, V>,
+    key: K,
+    make: impl FnOnce() -> Result<V>,
+) -> Result<V> {
+    match map.entry(key) {
+        hash_map::Entry::Occupied(e) => Ok(e.get().clone()),
+        hash_map::Entry::Vacant(e) => Ok(e.insert(make()?).clone()),
+    }
+}
+
+impl<'a> Plan<'a> {
+    fn new(ws: &'a Workspace) -> Self {
+        Plan {
+            ws,
+            patterns: HashMap::new(),
+            owned: HashMap::new(),
+            shared: HashMap::new(),
+            closures: HashMap::new(),
+            prepared: HashSet::new(),
+        }
+    }
+
+    /// Precomputes the dependency closures of `projects` in parallel.
+    fn with_closures(ws: &'a Workspace, projects: HashSet<&'a str>) -> Self {
+        let closures: Vec<(&str, Vec<&str>)> = projects
+            .into_par_iter()
+            .map(|name| (name, ws.dependency_closure(name).into_iter().collect()))
+            .collect();
+        Plan {
+            closures: closures
+                .into_iter()
+                .map(|(name, closure)| (name, Rc::from(closure)))
+                .collect(),
+            ..Plan::new(ws)
+        }
+    }
+
+    fn patterns(&mut self, inputs: &'a [String]) -> Result<Rc<Patterns>> {
+        memo(&mut self.patterns, inputs, || {
+            Patterns::new(inputs).map(Rc::new)
+        })
+    }
+
+    /// Files `project` owns that match the project-relative globs. Only owned files, so a
+    /// project at the workspace root never sees its nested projects' files.
+    fn owned(&mut self, project: &'a Project, inputs: &'a [String]) -> Result<Rc<[PathBuf]>> {
+        let patterns = self.patterns(inputs)?;
+        memo(&mut self.owned, (project.name.as_str(), inputs), || {
+            Ok(project
+                .files
+                .iter()
+                .filter(|f| {
+                    f.strip_prefix(&project.root)
+                        .is_ok_and(|rel| patterns.matches_project(rel))
+                })
+                .cloned()
+                .collect())
+        })
+    }
+
+    fn shared(&mut self, inputs: &'a [String]) -> Result<Rc<[PathBuf]>> {
+        let patterns = self.patterns(inputs)?;
+        let ws = self.ws;
+        memo(&mut self.shared, inputs, || {
+            Ok(if patterns.has_workspace_globs() {
+                ws.files
+                    .iter()
+                    .filter(|f| patterns.matches_workspace(f))
+                    .cloned()
+                    .collect()
+            } else {
+                Rc::from([])
+            })
+        })
+    }
+
+    fn closure(&mut self, name: &'a str) -> Rc<[&'a str]> {
+        let ws = self.ws;
+        self.closures
+            .entry(name)
+            .or_insert_with(|| ws.dependency_closure(name).into_iter().collect())
+            .clone()
+    }
+
+    fn own_inputs(&mut self, project: &'a Project, inputs: &'a [String]) -> Result<Vec<PathBuf>> {
+        let owned = self.owned(project, inputs)?;
+        let shared = self.shared(inputs)?;
+        Ok(owned
+            .iter()
+            .chain(shared.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+
+    fn task(&mut self, id: &'a TaskId) -> Result<TaskInputs<'a>> {
+        let ws = self.ws;
+        let project = &ws.projects[&id.project];
+        let target = ws.target(id);
+        let closure = (target.deps_usage != DepsUsage::None).then(|| self.closure(&project.name));
+        let unprepared = closure.as_ref().filter(|_| {
+            self.prepared
+                .insert((project.name.as_str(), &target.inputs))
+        });
+        unprepared
+            .iter()
+            .flat_map(|names| names.iter())
+            .try_for_each(|dep| self.owned(&ws.projects[*dep], &target.inputs).map(drop))?;
+        Ok(TaskInputs {
+            id,
+            project,
+            target,
+            own: self.own_inputs(project, &target.inputs)?,
+            closure,
+        })
+    }
+
+    /// Every path some task hashes, each once.
+    fn files(&self) -> Vec<&Path> {
+        self.owned
+            .values()
+            .chain(self.shared.values())
+            .flat_map(|files| files.iter())
+            .map(PathBuf::as_path)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// The files of `dep` matching `inputs`, as one digest shared by all dependents.
+    fn dep_digest(
+        &self,
+        dep: &str,
+        inputs: &[String],
+        digests: &HashMap<&Path, String>,
+    ) -> blake3::Hash {
+        let mut fields = Fields::new();
+        self.owned[&(dep, inputs)].iter().for_each(|path| {
+            fields
+                .add("dep_input", path_bytes(path))
+                .add("content", &digests[path.as_path()]);
+        });
+        fields.hash()
+    }
 }
 
 #[cfg(test)]
@@ -916,6 +1128,56 @@ command = "make a"
         assert_eq!(digest == MISSING, !created);
         cache.save(dir.path()).unwrap();
         assert!(FileHashCache::load(dir.path()).entries.is_empty());
+    }
+
+    /// `cargo test --release hash::tests::scale -- --ignored --nocapture`; set
+    /// `AXONAL_SCALE_N` to change the project count.
+    #[test]
+    #[ignore]
+    fn scale() {
+        use std::{fmt::Write as _, time::Instant};
+        let n: usize = std::env::var("AXONAL_SCALE_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config =
+            String::from("[targets.build]\ndepends_on = [\"^build\"]\n\n[targets.test]\n\n");
+        for i in 0..n {
+            let deps = if i == 0 {
+                String::new()
+            } else {
+                format!("\"p/{:04}\"", i - 1)
+            };
+            writeln!(config, "[projects.\"p/{i:04}\"]\ndeps = [{deps}]\n").unwrap();
+            writeln!(
+                config,
+                "[projects.\"p/{i:04}\".targets.build]\ncommand = \"b\"\n"
+            )
+            .unwrap();
+            writeln!(
+                config,
+                "[projects.\"p/{i:04}\".targets.test]\ncommand = \"t\"\n"
+            )
+            .unwrap();
+            for f in 0..20 {
+                let rel = format!("p/{i:04}/src/f{f}.ts");
+                write(dir.path(), &rel, &format!("{i}-{f}"));
+                back_date(&dir.path().join(rel));
+            }
+        }
+        write(dir.path(), "axonal.toml", &config);
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let graph = TaskGraph::build(&ws, &["build".into(), "test".into()], None).unwrap();
+        let run = |label: &str| {
+            let mut cache = FileHashCache::load(dir.path());
+            let start = Instant::now();
+            let keys = task_keys(&ws, &graph, &mut cache, &Toolchain::default(), &no_env).unwrap();
+            println!("{label}: {} keys in {:?}", keys.len(), start.elapsed());
+            cache.save(dir.path()).unwrap();
+        };
+        run("cold");
+        run("warm");
     }
 
     #[cfg(unix)]
