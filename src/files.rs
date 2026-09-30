@@ -155,6 +155,16 @@ impl Patterns {
         !self.workspace_globs.is_empty()
     }
 
+    /// Project-relative globs without metacharacters: each names a single path.
+    pub fn project_literals(&self) -> impl Iterator<Item = &str> {
+        literals(&self.project_globs)
+    }
+
+    /// `{workspace}/` globs (prefix stripped) without metacharacters.
+    pub fn workspace_literals(&self) -> impl Iterator<Item = &str> {
+        literals(&self.workspace_globs)
+    }
+
     /// Existing files matching these globs, found by walking each glob's literal base
     /// directory without gitignore filtering (outputs are usually ignored).
     /// Workspace-relative and sorted.
@@ -191,6 +201,13 @@ impl Patterns {
         }
         Ok(found.into_iter().collect())
     }
+}
+
+fn literals(globs: &[String]) -> impl Iterator<Item = &str> {
+    globs
+        .iter()
+        .map(String::as_str)
+        .filter(|g| !g.contains(['*', '?', '[', ']', '{', '}', '\\']))
 }
 
 fn glob_set(globs: &[String]) -> Result<GlobSet> {
@@ -325,6 +342,20 @@ mod tests {
                 .unwrap()
                 .has_workspace_globs()
         );
+    }
+
+    #[test]
+    fn literals_are_globs_without_metacharacters() {
+        let p = Patterns::new(&[
+            "src/**".into(),
+            ".env.local".into(),
+            "a/{b,c}".into(),
+            "{workspace}/.npmrc".into(),
+            "{workspace}/*.lock".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.project_literals().collect::<Vec<_>>(), [".env.local"]);
+        assert_eq!(p.workspace_literals().collect::<Vec<_>>(), [".npmrc"]);
     }
 
     #[test]

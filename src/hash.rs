@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::DepsUsage,
     error::{Error, Result},
-    files::{Patterns, display_root},
+    files::{self, Patterns, display_root},
     graph::{Kind, Project, Target, TaskGraph, TaskId, Workspace},
 };
 
@@ -427,6 +427,11 @@ fn hash_task(
             .add("input", path_bytes(path))
             .add("content", &digests[path.as_path()]);
     }
+    for path in task.implicit.iter() {
+        fields
+            .add("implicit", path_bytes(path))
+            .add("content", &digests[path.as_path()]);
+    }
     if let Some(closure) = closure {
         fields.add("dependency_closure", closure.as_bytes());
     }
@@ -480,7 +485,8 @@ fn path_bytes(path: &Path) -> &[u8] {
 }
 
 /// Owned files matching the target's project globs, plus any workspace file matching its
-/// `{workspace}/` globs. Workspace-relative and sorted.
+/// `{workspace}/` globs, plus literal globs naming existing (even gitignored) files, minus
+/// the project's outputs. Excludes implicit inputs. Workspace-relative and sorted.
 pub fn input_files(ws: &Workspace, project: &Project, target: &Target) -> Result<Vec<PathBuf>> {
     Plan::new(ws).own_inputs(project, &target.inputs)
 }
@@ -491,17 +497,43 @@ struct TaskInputs<'a> {
     project: &'a Project,
     target: &'a Target,
     own: Vec<PathBuf>,
+    implicit: Rc<[PathBuf]>,
     /// The dependency closure, unless `deps_usage = none`.
     closure: Option<Rc<[&'a str]>>,
 }
 
-/// Per-run memos of everything tasks share: glob sets, the files matching an inputs
-/// list in a project, workspace matches and dependency closures.
+/// Workspace files every Cargo project's tasks depend on, whatever their `inputs`.
+const CARGO_WORKSPACE_FILES: [&str; 6] = [
+    "Cargo.lock",
+    "Cargo.toml",
+    ".cargo/config.toml",
+    ".cargo/config",
+    "rust-toolchain.toml",
+    "rust-toolchain",
+];
+/// Workspace files every JS project's tasks depend on, whatever their `inputs`.
+const JS_WORKSPACE_FILES: [&str; 4] = [
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "package.json",
+    ".npmrc",
+];
+
+/// `rel` names something other than a directory, gitignored or not.
+fn exists(root: &Path, rel: &Path) -> bool {
+    fs::symlink_metadata(root.join(rel)).is_ok_and(|meta| !meta.is_dir())
+}
+
+/// Per-run memos of everything tasks share: glob sets, each project's outputs, the files
+/// matching an inputs list in a project, workspace matches, implicit inputs and
+/// dependency closures.
 struct Plan<'a> {
     ws: &'a Workspace,
     patterns: HashMap<&'a [String], Rc<Patterns>>,
+    outputs: HashMap<&'a str, Rc<Patterns>>,
     owned: HashMap<(&'a str, &'a [String]), Rc<[PathBuf]>>,
     shared: HashMap<&'a [String], Rc<[PathBuf]>>,
+    implicit: HashMap<&'a str, Rc<[PathBuf]>>,
     closures: HashMap<&'a str, Rc<[&'a str]>>,
     /// `(project, inputs)` pairs whose closure files are already in `owned`.
     prepared: HashSet<(&'a str, &'a [String])>,
@@ -523,8 +555,10 @@ impl<'a> Plan<'a> {
         Plan {
             ws,
             patterns: HashMap::new(),
+            outputs: HashMap::new(),
             owned: HashMap::new(),
             shared: HashMap::new(),
+            implicit: HashMap::new(),
             closures: HashMap::new(),
             prepared: HashSet::new(),
         }
@@ -551,37 +585,107 @@ impl<'a> Plan<'a> {
         })
     }
 
-    /// Files `project` owns that match the project-relative globs. Only owned files, so a
-    /// project at the workspace root never sees its nested projects' files.
+    /// The union of every target's `outputs` in `project`.
+    fn outputs(&mut self, project: &'a Project) -> Result<Rc<Patterns>> {
+        memo(&mut self.outputs, project.name.as_str(), || {
+            let globs: Vec<String> = project
+                .targets
+                .values()
+                .flat_map(|t| t.outputs.iter().cloned())
+                .collect();
+            Patterns::new(&globs).map(Rc::new)
+        })
+    }
+
+    /// Files `project` owns that match the project-relative globs, plus literal globs
+    /// naming existing files even if gitignored, minus the project's outputs. Only owned
+    /// files, so a project at the workspace root never sees its nested projects' files.
     fn owned(&mut self, project: &'a Project, inputs: &'a [String]) -> Result<Rc<[PathBuf]>> {
         let patterns = self.patterns(inputs)?;
+        let outputs = self.outputs(project)?;
+        let ws = self.ws;
         memo(&mut self.owned, (project.name.as_str(), inputs), || {
-            Ok(project
+            let root = &project.root;
+            let globbed = project
                 .files
                 .iter()
                 .filter(|f| {
-                    f.strip_prefix(&project.root)
+                    f.strip_prefix(root)
                         .is_ok_and(|rel| patterns.matches_project(rel))
                 })
-                .cloned()
+                .cloned();
+            let literal = patterns
+                .project_literals()
+                .filter_map(|glob| files::normalize(&root.join(glob)))
+                .filter(|path| exists(&ws.root, path));
+            Ok(globbed
+                .chain(literal)
+                .filter(|f| {
+                    !(f.strip_prefix(root)
+                        .is_ok_and(|rel| outputs.matches_project(rel))
+                        || outputs.matches_workspace(f))
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect())
         })
     }
 
+    /// Workspace files matching the `{workspace}/` globs, plus literal ones naming
+    /// existing files even if gitignored.
     fn shared(&mut self, inputs: &'a [String]) -> Result<Rc<[PathBuf]>> {
         let patterns = self.patterns(inputs)?;
         let ws = self.ws;
         memo(&mut self.shared, inputs, || {
-            Ok(if patterns.has_workspace_globs() {
-                ws.files
-                    .iter()
-                    .filter(|f| patterns.matches_workspace(f))
-                    .cloned()
-                    .collect()
-            } else {
-                Rc::from([])
-            })
+            if !patterns.has_workspace_globs() {
+                return Ok(Rc::from([]));
+            }
+            let literal = patterns
+                .workspace_literals()
+                .filter_map(|glob| files::normalize(Path::new(glob)))
+                .filter(|path| exists(&ws.root, path));
+            Ok(ws
+                .files
+                .iter()
+                .filter(|f| patterns.matches_workspace(f))
+                .cloned()
+                .chain(literal)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect())
         })
+    }
+
+    /// Lockfiles, workspace manifests and toolchain files for the project's kinds (all of
+    /// them for explicit projects, which may run anything), plus its own manifests. No
+    /// `inputs` list can drop these; missing ones hash as `missing`.
+    fn implicit(&mut self, project: &'a Project) -> Rc<[PathBuf]> {
+        self.implicit
+            .entry(project.name.as_str())
+            .or_insert_with(|| {
+                let kinds = &project.kinds;
+                let uses = |kind: &Kind| kinds.contains(kind) || kinds.contains(&Kind::Explicit);
+                let workspace = [
+                    (Kind::Cargo, &CARGO_WORKSPACE_FILES[..]),
+                    (Kind::Js, &JS_WORKSPACE_FILES[..]),
+                ]
+                .into_iter()
+                .filter(|(kind, _)| uses(kind))
+                .flat_map(|(_, files)| files.iter().map(PathBuf::from));
+                let manifests = [(Kind::Js, "package.json"), (Kind::Cargo, "Cargo.toml")]
+                    .into_iter()
+                    .map(|(kind, name)| (kind, project.root.join(name)))
+                    .filter(|(kind, path)| {
+                        kinds.contains(kind) || project.files.binary_search(path).is_ok()
+                    })
+                    .map(|(_, path)| path);
+                workspace
+                    .chain(manifests)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .clone()
     }
 
     fn closure(&mut self, name: &'a str) -> Rc<[&'a str]> {
@@ -616,12 +720,17 @@ impl<'a> Plan<'a> {
         unprepared
             .iter()
             .flat_map(|names| names.iter())
-            .try_for_each(|dep| self.owned(&ws.projects[*dep], &target.inputs).map(drop))?;
+            .try_for_each(|dep| {
+                let dep = &ws.projects[*dep];
+                self.implicit(dep);
+                self.owned(dep, &target.inputs).map(drop)
+            })?;
         Ok(TaskInputs {
             id,
             project,
             target,
             own: self.own_inputs(project, &target.inputs)?,
+            implicit: self.implicit(project),
             closure,
         })
     }
@@ -631,6 +740,7 @@ impl<'a> Plan<'a> {
         self.owned
             .values()
             .chain(self.shared.values())
+            .chain(self.implicit.values())
             .flat_map(|files| files.iter())
             .map(PathBuf::as_path)
             .collect::<HashSet<_>>()
@@ -638,7 +748,8 @@ impl<'a> Plan<'a> {
             .collect()
     }
 
-    /// The files of `dep` matching `inputs`, as one digest shared by all dependents.
+    /// The files of `dep` matching `inputs` and its implicit inputs, as one digest shared
+    /// by all dependents.
     fn dep_digest(
         &self,
         dep: &str,
@@ -646,9 +757,11 @@ impl<'a> Plan<'a> {
         digests: &HashMap<&Path, String>,
     ) -> blake3::Hash {
         let mut fields = Fields::new();
-        self.owned[&(dep, inputs)].iter().for_each(|path| {
+        let owned = self.owned[&(dep, inputs)].iter().map(|p| ("dep_input", p));
+        let implicit = self.implicit[dep].iter().map(|p| ("dep_implicit", p));
+        owned.chain(implicit).for_each(|(name, path)| {
             fields
-                .add("dep_input", path_bytes(path))
+                .add(name, path_bytes(path))
                 .add("content", &digests[path.as_path()]);
         });
         fields.hash()
@@ -1128,6 +1241,143 @@ command = "make a"
         assert_eq!(digest == MISSING, !created);
         cache.save(dir.path()).unwrap();
         assert!(FileHashCache::load(dir.path()).entries.is_empty());
+    }
+
+    #[test]
+    fn declared_outputs_do_not_change_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "axonal.toml",
+            &format!(
+                "{ONE}\n[projects.\"apps/b\"]\ndeps = [\"libs/a\"]\n\n[projects.\"apps/b\".targets.build]\ncommand = \"make\"\n"
+            ),
+        );
+        write(dir.path(), "libs/a/src/a.txt", "a");
+        write(dir.path(), "apps/b/src/b.txt", "b");
+        let before = (
+            key_of(dir.path(), "build", "libs/a"),
+            key_of(dir.path(), "build", "apps/b"),
+        );
+        write(dir.path(), "libs/a/out/bundle.js", "built at 12:00");
+        let after = (
+            key_of(dir.path(), "build", "libs/a"),
+            key_of(dir.path(), "build", "apps/b"),
+        );
+        assert_eq!(
+            before, after,
+            "outputs are not inputs, here or in dependents"
+        );
+    }
+
+    #[test]
+    fn gitignored_literal_inputs_are_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.\"libs/a\".targets.build]\ncommand = \"make\"\ninputs = [\"src/**\", \".env.local\", \"{workspace}/.secrets\"]\n",
+        );
+        write(dir.path(), ".gitignore", ".env.local\n.secrets\n");
+        write(dir.path(), "libs/a/src/a.txt", "a");
+        write(dir.path(), "libs/a/.env.local", "API=1");
+        write(dir.path(), ".secrets", "1");
+        let before = key_of(dir.path(), "build", "libs/a");
+        write(dir.path(), "libs/a/.env.local", "API=2");
+        let env_changed = key_of(dir.path(), "build", "libs/a");
+        assert_ne!(before, env_changed);
+        write(dir.path(), ".secrets", "2");
+        assert_ne!(key_of(dir.path(), "build", "libs/a"), env_changed);
+    }
+
+    #[test]
+    fn explicit_projects_see_every_lockfile() {
+        let dir = one_project();
+        write(dir.path(), "pnpm-lock.yaml", "lodash: 4.17.20");
+        write(dir.path(), "Cargo.lock", "serde 1.0.1");
+        let before = key_of(dir.path(), "build", "libs/a");
+        write(dir.path(), "pnpm-lock.yaml", "lodash: 4.17.21");
+        let pnpm = key_of(dir.path(), "build", "libs/a");
+        assert_ne!(before, pnpm);
+        write(dir.path(), "Cargo.lock", "serde 1.0.2");
+        assert_ne!(key_of(dir.path(), "build", "libs/a"), pnpm);
+    }
+
+    /// A Cargo member `c` and a pnpm member `p`, which overrides its inputs.
+    fn mixed_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/c\"]\nresolver = \"2\"\n",
+        );
+        write(
+            dir.path(),
+            "crates/c/Cargo.toml",
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(dir.path(), "crates/c/src/lib.rs", "");
+        write(dir.path(), "Cargo.lock", "version = 3\n");
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\n",
+        );
+        write(dir.path(), "package.json", r#"{"private":true}"#);
+        write(
+            dir.path(),
+            "packages/p/package.json",
+            r#"{"name":"p","scripts":{"build":"tsc"}}"#,
+        );
+        write(dir.path(), "packages/p/src/index.ts", "");
+        write(dir.path(), "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.\"packages/p\".targets.build]\ninputs = [\"src/**\"]\n",
+        );
+        dir
+    }
+
+    #[test]
+    fn workspace_manifests_and_lockfiles_change_member_keys() {
+        let dir = mixed_workspace();
+        let both = || {
+            (
+                key_of(dir.path(), "build", "c"),
+                key_of(dir.path(), "build", "p"),
+            )
+        };
+        let (c, p) = both();
+        write(dir.path(), "Cargo.lock", "version = 3\n# bumped\n");
+        let (c2, p2) = both();
+        assert_ne!(c, c2, "Cargo.lock is a Cargo input");
+        assert_eq!(p, p2, "Cargo.lock is not a pnpm input");
+        write(dir.path(), "pnpm-lock.yaml", "lockfileVersion: '9.1'\n");
+        let (c3, p3) = both();
+        assert_eq!(c2, c3);
+        assert_ne!(p2, p3, "pnpm-lock.yaml is a pnpm input");
+        write(
+            dir.path(),
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.96\"\n",
+        );
+        write(dir.path(), ".npmrc", "strict-peer-dependencies=true\n");
+        let (c4, p4) = both();
+        assert_ne!(c3, c4);
+        assert_ne!(p3, p4);
+    }
+
+    #[test]
+    fn custom_inputs_still_see_their_own_manifest() {
+        let dir = mixed_workspace();
+        let before = key_of(dir.path(), "build", "p");
+        write(
+            dir.path(),
+            "packages/p/package.json",
+            r#"{"name":"p","version":"2.0.0","scripts":{"build":"tsc"}}"#,
+        );
+        assert_ne!(key_of(dir.path(), "build", "p"), before);
     }
 
     /// `cargo test --release hash::tests::scale -- --ignored --nocapture`; set
