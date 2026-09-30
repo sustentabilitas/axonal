@@ -67,15 +67,15 @@ pub fn discover(root: &Path, files: &[PathBuf]) -> Result<Vec<JsPackage>> {
     files
         .iter()
         .filter(|f| f.file_name().is_some_and(|n| n == "package.json"))
-        .filter_map(|f| f.parent())
-        .filter(|dir| {
+        .filter_map(|manifest| manifest.parent().map(|dir| (manifest, dir)))
+        .filter(|(manifest, dir)| {
             if dir.as_os_str().is_empty() {
                 include_root
             } else {
-                include.is_match(dir) && !exclude.is_match(dir)
+                include.is_match(manifest) && !exclude.is_match(manifest)
             }
         })
-        .map(|dir| read_package(root, dir))
+        .map(|(_, dir)| read_package(root, dir))
         .collect()
 }
 
@@ -94,9 +94,10 @@ pub fn targets(scripts: &BTreeMap<String, String>) -> BTreeMap<String, TargetCon
 }
 
 fn shell_word(word: &str) -> String {
-    if word
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_:./@".contains(c))
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_:./@".contains(c))
     {
         word.to_string()
     } else {
@@ -116,8 +117,8 @@ fn read_package(root: &Path, dir: &Path) -> Result<JsPackage> {
     ]
     .into_iter()
     .flatten()
-    .filter(|(_, spec)| spec.starts_with("workspace:"))
-    .map(|(name, _)| name.clone())
+    .filter_map(|(name, spec)| workspace_dep(name, spec))
+    .map(str::to_string)
     .collect();
     Ok(JsPackage {
         name: pkg
@@ -129,12 +130,24 @@ fn read_package(root: &Path, dir: &Path) -> Result<JsPackage> {
     })
 }
 
+/// The package a `workspace:` specifier points at: the dependency name, or the
+/// aliased target in `workspace:<pkg>@<range>`.
+fn workspace_dep<'a>(name: &'a str, spec: &'a str) -> Option<&'a str> {
+    let rest = spec.strip_prefix("workspace:")?;
+    Some(
+        rest.rfind('@')
+            .filter(|&i| i > 0)
+            .map_or(name, |i| &rest[..i]),
+    )
+}
+
+/// pnpm matches package globs against `<glob>/package.json`, not the directory.
 fn glob_set(globs: impl Iterator<Item = String>, path: &Path) -> Result<GlobSet> {
     globs
         .filter(|g| !matches!(g.as_str(), "" | "."))
         .try_fold(GlobSetBuilder::new(), |mut set, g| {
             set.add(
-                GlobBuilder::new(&g)
+                GlobBuilder::new(&format!("{g}/package.json"))
                     .literal_separator(true)
                     .build()
                     .map_err(|e| config_error(path, e))?,
@@ -262,5 +275,77 @@ mod tests {
             t["my script"].command.as_deref(),
             Some("pnpm run 'my script'")
         );
+    }
+
+    #[test]
+    fn empty_script_name_is_quoted() {
+        let t = targets(&BTreeMap::from([(String::new(), "x".to_string())]));
+        assert_eq!(t[""].command.as_deref(), Some("pnpm run ''"));
+    }
+
+    #[test]
+    fn aliased_workspace_deps_resolve_to_the_real_package() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), WORKSPACE_FILE, "packages: ['apps/*']\n");
+        write(
+            dir.path(),
+            "apps/web/package.json",
+            r#"{"dependencies":{
+                "ui-next":"workspace:@acme/ui@*",
+                "utils-alias":"workspace:utils@^",
+                "@acme/core":"workspace:~",
+                "@acme/lib":"workspace:1.2.3"}}"#,
+        );
+        assert_eq!(
+            discover_in(dir.path()).unwrap()[0].workspace_deps,
+            BTreeSet::from(["@acme/core", "@acme/lib", "@acme/ui", "utils"].map(String::from))
+        );
+    }
+
+    #[test]
+    fn exclusion_globs_match_manifests_like_pnpm() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            WORKSPACE_FILE,
+            "packages: ['libs/*', '!libs/legacy/**']\n",
+        );
+        write(dir.path(), "libs/ui/package.json", r#"{"name":"ui"}"#);
+        write(
+            dir.path(),
+            "libs/legacy/package.json",
+            r#"{"name":"legacy"}"#,
+        );
+        let names: Vec<String> = discover_in(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["ui"]);
+    }
+
+    #[test]
+    fn dot_slash_and_trailing_slash_patterns_are_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), WORKSPACE_FILE, "packages: ['./apps/*/']\n");
+        write(dir.path(), "apps/web/package.json", r#"{"name":"web"}"#);
+        assert_eq!(
+            discover_in(dir.path()).unwrap()[0].root,
+            PathBuf::from("apps/web")
+        );
+    }
+
+    #[test]
+    fn double_star_does_not_include_the_root_package() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), WORKSPACE_FILE, "packages: ['**']\n");
+        write(dir.path(), "package.json", r#"{"name":"root"}"#);
+        write(dir.path(), "libs/ui/package.json", r#"{"name":"ui"}"#);
+        let names: Vec<String> = discover_in(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["ui"]);
     }
 }
