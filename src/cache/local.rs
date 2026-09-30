@@ -1,30 +1,26 @@
 //! The local cache in `.axonal/cache`: `<key>.tar.zst` plus `<key>.json`, evicted by
 //! least-recent use (a hit refreshes the metadata file's mtime).
 //!
-//! Every operation holds a cache-wide lock on `.lock`, shared for reads and exclusive for
-//! writes, eviction and cleaning, so neither threads nor concurrent axonal processes can
-//! observe or evict a half-written entry.
+//! Operations hold a cache-wide lock on `.lock`, shared for reads and exclusive for
+//! writes, eviction and cleaning. Entry files are only ever replaced by rename, so an
+//! archive opened under the lock can be verified and restored after it is released.
 
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Seek, Write},
     path::{Path, PathBuf},
-    process,
-    sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
 };
 
-use tap::{Pipe, Tap};
+use tap::Tap;
 
-use super::{Entry, Store};
+use super::{CacheError, Entry, Meta, Store, existing, temp::Temp};
 use crate::hash::Key;
 
 const LOCK: &str = ".lock";
 const TMP: &str = ".tmp";
 const ARCHIVE: &str = ".tar.zst";
 const META: &str = ".json";
-
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct Local {
@@ -67,42 +63,46 @@ impl Local {
         )
     }
 
-    fn checked_paths(&self, key: &Key) -> anyhow::Result<(PathBuf, PathBuf)> {
-        anyhow::ensure!(is_key(&key.0), "invalid cache key `{key}`");
-        Ok(self.paths(key))
+    fn checked_paths(&self, key: &Key) -> Result<(PathBuf, PathBuf), CacheError> {
+        if is_key(&key.0) {
+            Ok(self.paths(key))
+        } else {
+            Err(CacheError::InvalidKey(key.clone()))
+        }
     }
 
     /// `None` when the cache directory does not exist; the lock is released on drop.
     fn lock(&self, mode: Lock) -> io::Result<Option<fs::File>> {
-        fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.dir.join(LOCK))
-            .pipe(existing)?
-            .map(|file| {
-                match mode {
-                    Lock::Shared => file.lock_shared(),
-                    Lock::Exclusive => file.lock(),
-                }
-                .map(|()| file)
-            })
-            .transpose()
+        existing(
+            fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(self.dir.join(LOCK)),
+        )?
+        .map(|file| {
+            match mode {
+                Lock::Shared => file.lock_shared(),
+                Lock::Exclusive => file.lock(),
+            }
+            .map(|()| file)
+        })
+        .transpose()
     }
 
     fn names(&self) -> io::Result<Vec<String>> {
-        existing(fs::read_dir(&self.dir))?
+        Ok(existing(fs::read_dir(&self.dir))?
             .into_iter()
             .flatten()
             .filter_map(Result::ok)
             .filter_map(|e| e.file_name().into_string().ok())
-            .collect::<Vec<_>>()
-            .pipe(Ok)
+            .collect())
     }
 
     fn items(&self) -> io::Result<Vec<Item>> {
-        self.names()?
+        Ok(self
+            .names()?
             .iter()
             .filter_map(|name| name.strip_suffix(META).filter(|stem| is_key(stem)))
             .filter_map(|stem| {
@@ -115,8 +115,7 @@ impl Local {
                     key,
                 })
             })
-            .collect::<Vec<_>>()
-            .pipe(Ok)
+            .collect())
     }
 
     /// Metadata first, so a partly removed entry is never visible.
@@ -138,6 +137,37 @@ impl Local {
                         .is_some_and(|stem| !self.dir.join(format!("{stem}{META}")).exists())
             })
             .try_for_each(|name| existing(fs::remove_file(self.dir.join(name))).map(drop))
+    }
+
+    /// Removes an entry found bad, unless a put has replaced its metadata since.
+    fn discard(&self, key: &Key, meta_bytes: &[u8]) -> io::Result<()> {
+        let Some(_lock) = self.lock(Lock::Exclusive)? else {
+            return Ok(());
+        };
+        if existing(fs::read(self.paths(key).1))?.is_some_and(|current| current == meta_bytes) {
+            self.remove(key)?;
+        }
+        Ok(())
+    }
+
+    /// Moves `archive` beside the entries under a temp name, copying it across
+    /// filesystems.
+    fn stage_archive(&self, key: &Key, archive: &Path) -> io::Result<Temp> {
+        let temp = Temp::reserve(&self.dir, &format!(".{key}{ARCHIVE}."), TMP)?;
+        match fs::rename(archive, temp.path()) {
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                fs::copy(archive, temp.path())?;
+                fs::remove_file(archive)?;
+            }
+            result => result?,
+        }
+        Ok(temp)
+    }
+
+    fn stage_meta(&self, key: &Key, meta: &Meta) -> Result<Temp, CacheError> {
+        let (temp, mut file) = Temp::file(&self.dir, &format!(".{key}{META}."), TMP)?;
+        file.write_all(&serde_json::to_vec(meta)?)?;
+        Ok(temp)
     }
 
     pub fn stats(&self) -> io::Result<Stats> {
@@ -185,37 +215,80 @@ impl Local {
 }
 
 impl Store for Local {
-    fn get(&self, key: &Key) -> anyhow::Result<Option<Entry>> {
-        let (archive, meta) = self.checked_paths(key)?;
-        let Some(_lock) = self.lock(Lock::Shared)? else {
+    fn get(&self, key: &Key) -> Result<Option<Entry>, CacheError> {
+        let (archive_path, meta_path) = self.checked_paths(key)?;
+        let (meta_bytes, archive) = {
+            let Some(_lock) = self.lock(Lock::Shared)? else {
+                return Ok(None);
+            };
+            let Some(meta_bytes) = existing(fs::read(&meta_path))? else {
+                return Ok(None);
+            };
+            (meta_bytes, existing(fs::File::open(&archive_path))?)
+        };
+        let Some(mut archive) = archive else {
+            let _ = self.discard(key, &meta_bytes);
             return Ok(None);
         };
-        let Some(meta_bytes) = existing(fs::read(&meta))? else {
-            return Ok(None);
-        };
-        let entry = Entry {
-            meta: serde_json::from_slice(&meta_bytes)?,
-            archive: fs::read(&archive)?,
-        };
-        entry.verify()?;
-        let _ = fs::File::options()
-            .write(true)
-            .open(&meta)
-            .and_then(|f| f.set_modified(SystemTime::now()));
-        Ok(Some(entry))
+        match verify(key, &meta_bytes, &mut archive) {
+            Ok(meta) => {
+                archive.rewind()?;
+                let _ = fs::File::options()
+                    .write(true)
+                    .open(&meta_path)
+                    .and_then(|f| f.set_modified(SystemTime::now()));
+                Ok(Some(Entry { meta, archive }))
+            }
+            Err(e) => {
+                if e.is_corrupt() {
+                    let _ = self.discard(key, &meta_bytes);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// The old metadata goes first and the new metadata last, so an entry is only visible
     /// once complete, even if the write is interrupted.
-    fn put(&self, key: &Key, entry: &Entry) -> anyhow::Result<()> {
-        let (archive, meta) = self.checked_paths(key)?;
+    fn put(&self, key: &Key, meta: &Meta, archive: &Path) -> Result<(), CacheError> {
+        let (archive_path, meta_path) = self.checked_paths(key)?;
+        if meta.key != *key {
+            return Err(CacheError::WrongKey {
+                expected: key.clone(),
+                actual: meta.key.clone(),
+            });
+        }
         fs::create_dir_all(&self.dir)?;
         let _lock = self.lock(Lock::Exclusive)?;
-        existing(fs::remove_file(&meta))?;
-        write_atomic(&archive, &entry.archive)?;
-        write_atomic(&meta, &serde_json::to_vec(&entry.meta)?)?;
+        let staged_archive = self.stage_archive(key, archive)?;
+        let staged_meta = self.stage_meta(key, meta)?;
+        existing(fs::remove_file(&meta_path))?;
+        staged_archive.persist(&archive_path)?;
+        staged_meta.persist(&meta_path)?;
         Ok(())
     }
+}
+
+fn verify(key: &Key, meta_bytes: &[u8], archive: &mut fs::File) -> Result<Meta, CacheError> {
+    let meta: Meta = serde_json::from_slice(meta_bytes)?;
+    if meta.key != *key {
+        return Err(CacheError::WrongKey {
+            expected: key.clone(),
+            actual: meta.key,
+        });
+    }
+    let actual = blake3::Hasher::new()
+        .update_reader(archive)?
+        .finalize()
+        .to_hex()
+        .to_string();
+    if actual != meta.archive_blake3 {
+        return Err(CacheError::Corrupt {
+            expected: meta.archive_blake3,
+            actual,
+        });
+    }
+    Ok(meta)
 }
 
 /// Keys become file names, so they must not contain separators, dots or `..`.
@@ -225,69 +298,37 @@ fn is_key(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Maps a missing file or directory to `None`.
-fn existing<T>(result: io::Result<T>) -> io::Result<Option<T>> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// Writes a uniquely named temp file beside `path`, then renames it into place.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let name = path
-        .file_name()
-        .expect("cache paths have file names")
-        .to_string_lossy();
-    let tmp = path.with_file_name(format!(
-        ".{name}.{}.{}{TMP}",
-        process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::File::options()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut file| file.write_all(bytes))
-        .and_then(|()| fs::rename(&tmp, path))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::archive;
+    use crate::cache::{Packed, archive};
     use std::time::Duration;
 
-    fn entry(logs: &str) -> Entry {
-        Entry::new(
-            0,
-            5,
-            logs.into(),
-            vec![],
-            archive::pack(Path::new("."), &[]).unwrap(),
-        )
+    /// A packed one-file archive whose contents and logs are `tag`, from its own source tree.
+    fn staged(key: &Key, tag: &str) -> (tempfile::TempDir, Meta, Packed) {
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("out.txt"), tag).unwrap();
+        let packed = archive::pack(src.path(), &[PathBuf::from("out.txt")]).unwrap();
+        let meta = Meta::new(key.clone(), 0, 5, tag.into(), &packed);
+        (src, meta, packed)
     }
 
-    /// Entries that differ in both metadata and archive bytes.
-    fn distinct(tag: &str) -> Entry {
-        Entry::new(
-            0,
-            5,
-            tag.into(),
-            vec![],
-            format!("archive {tag}").into_bytes(),
-        )
+    fn put(store: &Local, key: &Key, tag: &str) -> Meta {
+        let (_src, meta, packed) = staged(key, tag);
+        store.put(key, &meta, packed.path()).unwrap();
+        meta
     }
 
-    fn age(store: &Local, key: &Key, secs: u64) {
-        let (_, meta) = store.paths(key);
+    fn restored(entry: Entry) -> String {
+        let dst = tempfile::tempdir().unwrap();
+        archive::restore(dst.path(), &entry.meta, &entry.archive, &[]).unwrap();
+        fs::read_to_string(dst.path().join("out.txt")).unwrap()
+    }
+
+    fn age(path: &Path, secs: u64) {
         fs::File::options()
             .write(true)
-            .open(meta)
+            .open(path)
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(secs))
             .unwrap();
@@ -306,19 +347,82 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Local::new(dir.path());
         let key = Key("k1".into());
-        store.put(&key, &entry("hello")).unwrap();
-        assert_eq!(store.get(&key).unwrap(), Some(entry("hello")));
-        assert_eq!(store.get(&Key("missing".into())).unwrap(), None);
+        let meta = put(&store, &key, "hello");
+        let entry = store.get(&key).unwrap().unwrap();
+        assert_eq!(entry.meta, meta);
+        assert_eq!(restored(entry), "hello");
+        assert!(store.get(&Key("missing".into())).unwrap().is_none());
     }
 
     #[test]
-    fn corrupt_archives_are_errors() {
+    fn put_moves_the_archive_into_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let store = Local::new(dir.path());
         let key = Key("k1".into());
-        store.put(&key, &entry("hello")).unwrap();
+        let (_src, meta, packed) = staged(&key, "hello");
+        store.put(&key, &meta, packed.path()).unwrap();
+        assert!(!packed.path().exists());
+        assert_eq!(names(&store), [".lock", "k1.json", "k1.tar.zst"]);
+    }
+
+    #[test]
+    fn put_rejects_metadata_for_another_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        let (_src, meta, packed) = staged(&Key("k1".into()), "hello");
+        let err = store.put(&Key("k2".into()), &meta, packed.path());
+        assert!(matches!(err, Err(CacheError::WrongKey { .. })), "{err:?}");
+    }
+
+    #[test]
+    fn corrupt_archives_are_errors_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        let key = Key("k1".into());
+        put(&store, &key, "hello");
         fs::write(store.paths(&key).0, b"garbage").unwrap();
-        assert!(store.get(&key).is_err());
+        let err = store.get(&key);
+        assert!(matches!(err, Err(CacheError::Corrupt { .. })), "{err:?}");
+        assert!(store.get(&key).unwrap().is_none());
+        assert_eq!(names(&store), [".lock"]);
+    }
+
+    #[test]
+    fn malformed_metadata_is_an_error_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        let key = Key("k1".into());
+        put(&store, &key, "hello");
+        fs::write(store.paths(&key).1, b"{").unwrap();
+        let err = store.get(&key);
+        assert!(matches!(err, Err(CacheError::Malformed(_))), "{err:?}");
+        assert!(store.get(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn entries_copied_to_another_key_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        let (k1, k2) = (Key("k1".into()), Key("k2".into()));
+        put(&store, &k1, "hello");
+        let ((a1, m1), (a2, m2)) = (store.paths(&k1), store.paths(&k2));
+        fs::copy(a1, a2).unwrap();
+        fs::copy(m1, m2).unwrap();
+        let err = store.get(&k2);
+        assert!(matches!(err, Err(CacheError::WrongKey { .. })), "{err:?}");
+        assert!(store.get(&k2).unwrap().is_none());
+        assert!(store.get(&k1).unwrap().is_some());
+    }
+
+    #[test]
+    fn metadata_without_an_archive_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        let key = Key("k1".into());
+        put(&store, &key, "hello");
+        fs::remove_file(store.paths(&key).0).unwrap();
+        assert!(store.get(&key).unwrap().is_none());
+        assert_eq!(names(&store), [".lock"]);
     }
 
     #[test]
@@ -327,8 +431,8 @@ mod tests {
         let store = Local::new(dir.path());
         let keys = ["k1", "k2", "k3"].map(|k| Key(k.into()));
         for (i, key) in keys.iter().enumerate() {
-            store.put(key, &entry("same size")).unwrap();
-            age(&store, key, 300 - 100 * i as u64);
+            put(&store, key, "same size");
+            age(&store.paths(key).1, 300 - 100 * i as u64);
         }
         store.get(&keys[0]).unwrap();
         let stats = store.stats().unwrap();
@@ -344,7 +448,7 @@ mod tests {
     fn clean_removes_everything() {
         let dir = tempfile::tempdir().unwrap();
         let store = Local::new(dir.path());
-        store.put(&Key("k1".into()), &entry("x")).unwrap();
+        put(&store, &Key("k1".into()), "x");
         store.clean().unwrap();
         assert_eq!(store.stats().unwrap().entries, 0);
     }
@@ -353,7 +457,7 @@ mod tests {
     fn a_missing_cache_directory_is_empty_and_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let store = Local::new(dir.path());
-        assert_eq!(store.get(&Key("k1".into())).unwrap(), None);
+        assert!(store.get(&Key("k1".into())).unwrap().is_none());
         assert_eq!(store.stats().unwrap().entries, 0);
         assert_eq!(store.evict(0).unwrap(), 0);
         store.clean().unwrap();
@@ -366,7 +470,9 @@ mod tests {
         let store = Local::new(dir.path());
         for bad in ["", "../escape", "a/b", ".hidden", "k.json"] {
             let key = Key(bad.into());
-            assert!(store.put(&key, &entry("x")).is_err(), "{bad:?}");
+            let (_src, meta, packed) = staged(&key, "x");
+            let err = store.put(&key, &meta, packed.path());
+            assert!(matches!(err, Err(CacheError::InvalidKey(_))), "{bad:?}");
             assert!(store.get(&key).is_err(), "{bad:?}");
         }
         assert!(!dir.path().join(".axonal/escape.json").exists());
@@ -382,13 +488,14 @@ mod tests {
                 let (store, key) = (&store, &key);
                 s.spawn(move || {
                     (0..25).for_each(|i| {
-                        store.put(key, &distinct(&format!("{t}/{i}"))).unwrap();
+                        put(store, key, &format!("{t}/{i}"));
                         assert!(store.get(key).unwrap().is_some());
                     })
                 });
             })
         });
-        store.get(&key).unwrap().unwrap().verify().unwrap();
+        let entry = store.get(&key).unwrap().unwrap();
+        assert_eq!(restored(entry), store.get(&key).unwrap().unwrap().meta.logs);
         assert_eq!(names(&store), [".lock", "k1.json", "k1.tar.zst"]);
     }
 
@@ -398,14 +505,14 @@ mod tests {
         let store = Local::new(dir.path());
         let key = Key("k1".into());
         std::thread::scope(|s| {
-            s.spawn(|| (0..200).for_each(|i| store.put(&key, &distinct(&i.to_string())).unwrap()));
+            s.spawn(|| (0..100).for_each(|i| drop(put(&store, &key, &i.to_string()))));
             s.spawn(|| {
-                (0..200).for_each(|_| {
+                (0..100).for_each(|_| {
                     store.evict(0).unwrap();
                 })
             });
             s.spawn(|| {
-                (0..200).for_each(|_| {
+                (0..100).for_each(|_| {
                     store.get(&key).unwrap();
                 })
             });
@@ -414,11 +521,10 @@ mod tests {
     }
 
     #[test]
-    fn eviction_sweeps_partial_writes() {
+    fn eviction_sweeps_archives_without_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let store = Local::new(dir.path());
-        store.put(&Key("k1".into()), &entry("x")).unwrap();
-        fs::write(store.dir().join(".k2.json.1.0.tmp"), "partial").unwrap();
+        put(&store, &Key("k1".into()), "x");
         fs::write(store.paths(&Key("k2".into())).0, "orphan").unwrap();
         assert_eq!(store.evict(u64::MAX).unwrap(), 0);
         assert_eq!(names(&store), [".lock", "k1.json", "k1.tar.zst"]);
