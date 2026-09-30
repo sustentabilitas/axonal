@@ -1,30 +1,59 @@
 //! The local cache in `.axonal/cache`: `<key>.tar.zst` plus `<key>.json`, evicted by
 //! least-recent use (a hit refreshes the metadata file's mtime).
 //!
-//! Operations hold a cache-wide lock on `.lock`, shared for reads and exclusive for
-//! writes, eviction and cleaning. Entry files are only ever replaced by rename, so an
+//! Entry files are written to temp files first and only ever replaced by rename. Each
+//! operation briefly holds a cache-wide lock: shared to read entries, exclusive to swap
+//! them in, evict or clean. It is both a `flock` on `.lock`, for other processes, and an
+//! in-process `RwLock`, for threads where `flock` is emulated per process (NFS). An
 //! archive opened under the lock can be verified and restored after it is released.
 
 use std::{
+    collections::HashMap,
     fs,
     io::{self, Seek, Write},
     path::{Path, PathBuf},
-    time::SystemTime,
+    sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    time::{Duration, SystemTime},
 };
 
 use tap::Tap;
 
-use super::{CacheError, Entry, Meta, Store, existing, temp::Temp};
+use super::{CacheError, Entry, Meta, Store, TMP_DIR, existing, temp::Temp};
 use crate::hash::Key;
 
 const LOCK: &str = ".lock";
 const TMP: &str = ".tmp";
 const ARCHIVE: &str = ".tar.zst";
 const META: &str = ".json";
+/// Temp files older than this belong to writes that died.
+const STALE_TMP: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
 pub struct Local {
     dir: PathBuf,
+    scratch: PathBuf,
+    threads: Arc<RwLock<()>>,
+    #[cfg(test)]
+    pause: Option<Arc<std::sync::Barrier>>,
+}
+
+/// Held for the duration of a locked section; fields release in order on drop.
+struct Guard<'a> {
+    _flock: Option<fs::File>,
+    _read: Option<RwLockReadGuard<'a, ()>>,
+    _write: Option<RwLockWriteGuard<'a, ()>>,
+}
+
+/// One in-process lock per cache directory, shared by every `Local` for it.
+fn thread_lock(dir: &Path) -> Arc<RwLock<()>> {
+    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<RwLock<()>>>>> =
+        LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(dir.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +76,13 @@ enum Lock {
 
 impl Local {
     pub fn new(workspace_root: &Path) -> Local {
+        let dir = workspace_root.join(".axonal/cache");
         Local {
-            dir: workspace_root.join(".axonal/cache"),
+            threads: thread_lock(&dir),
+            scratch: workspace_root.join(TMP_DIR),
+            dir,
+            #[cfg(test)]
+            pause: None,
         }
     }
 
@@ -71,24 +105,41 @@ impl Local {
         }
     }
 
-    /// `None` when the cache directory does not exist; the lock is released on drop.
-    fn lock(&self, mode: Lock) -> io::Result<Option<fs::File>> {
-        existing(
-            fs::File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(self.dir.join(LOCK)),
-        )?
-        .map(|file| {
+    /// `None` when the cache directory does not exist. Shared locks open `.lock` read-only
+    /// and, in a read-only cache without one, rely on the in-process lock alone.
+    fn lock(&self, mode: Lock) -> io::Result<Option<Guard<'_>>> {
+        let (read, write) = match mode {
+            Lock::Shared => (
+                Some(self.threads.read().unwrap_or_else(PoisonError::into_inner)),
+                None,
+            ),
+            Lock::Exclusive => (
+                None,
+                Some(self.threads.write().unwrap_or_else(PoisonError::into_inner)),
+            ),
+        };
+        let path = self.dir.join(LOCK);
+        let opened = match mode {
+            Lock::Shared => existing(fs::File::open(&path))?,
+            Lock::Exclusive => None,
+        };
+        let flock = match opened.map_or_else(|| create_lock(&path), Ok) {
+            Ok(file) => Some(file),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if matches!(mode, Lock::Shared) && is_read_only(&e) => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(file) = &flock {
             match mode {
-                Lock::Shared => file.lock_shared(),
-                Lock::Exclusive => file.lock(),
+                Lock::Shared => file.lock_shared()?,
+                Lock::Exclusive => file.lock()?,
             }
-            .map(|()| file)
-        })
-        .transpose()
+        }
+        Ok(Some(Guard {
+            _flock: flock,
+            _read: read,
+            _write: write,
+        }))
     }
 
     fn names(&self) -> io::Result<Vec<String>> {
@@ -125,18 +176,31 @@ impl Local {
         existing(fs::remove_file(archive)).map(drop)
     }
 
-    /// Deletes temp files and archives without metadata left by interrupted writes. Only
-    /// safe under the exclusive lock, which every in-progress write holds.
+    /// Under the exclusive lock, deletes what interrupted work left behind: temp files and
+    /// scratch entries older than [`STALE_TMP`] (younger ones may still be being written),
+    /// and archives without metadata (entries are only swapped in under this lock).
     fn sweep(&self) -> io::Result<()> {
+        let cutoff = SystemTime::now() - STALE_TMP;
+        let stale = |path: &Path| {
+            fs::symlink_metadata(path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t < cutoff)
+        };
+        let orphan = |name: &str| {
+            name.strip_suffix(ARCHIVE)
+                .is_some_and(|stem| !self.dir.join(format!("{stem}{META}")).exists())
+        };
         self.names()?
             .into_iter()
-            .filter(|name| {
-                name.ends_with(TMP)
-                    || name
-                        .strip_suffix(ARCHIVE)
-                        .is_some_and(|stem| !self.dir.join(format!("{stem}{META}")).exists())
-            })
-            .try_for_each(|name| existing(fs::remove_file(self.dir.join(name))).map(drop))
+            .filter(|name| (name.ends_with(TMP) && stale(&self.dir.join(name))) || orphan(name))
+            .try_for_each(|name| remove_path(&self.dir.join(name)))?;
+        existing(fs::read_dir(&self.scratch))?
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|path| stale(path))
+            .try_for_each(|path| remove_path(&path))
     }
 
     /// Removes an entry found bad, unless a put has replaced its metadata since.
@@ -151,7 +215,7 @@ impl Local {
     }
 
     /// Moves `archive` beside the entries under a temp name, copying it across
-    /// filesystems.
+    /// filesystems, and marks it fresh so a concurrent sweep leaves it alone.
     fn stage_archive(&self, key: &Key, archive: &Path) -> io::Result<Temp> {
         let temp = Temp::reserve(&self.dir, &format!(".{key}{ARCHIVE}."), TMP)?;
         match fs::rename(archive, temp.path()) {
@@ -161,6 +225,7 @@ impl Local {
             }
             result => result?,
         }
+        fs::File::open(temp.path())?.set_modified(SystemTime::now())?;
         Ok(temp)
     }
 
@@ -210,7 +275,7 @@ impl Local {
         self.names()?
             .into_iter()
             .filter(|name| name != LOCK)
-            .try_for_each(|name| existing(fs::remove_file(self.dir.join(name))).map(drop))
+            .try_for_each(|name| remove_path(&self.dir.join(name)))
     }
 }
 
@@ -248,8 +313,9 @@ impl Store for Local {
         }
     }
 
-    /// The old metadata goes first and the new metadata last, so an entry is only visible
-    /// once complete, even if the write is interrupted.
+    /// Both files are staged unlocked. Under the lock the old metadata goes first and the
+    /// new metadata last, so an entry is only visible once complete, even if the write is
+    /// interrupted.
     fn put(&self, key: &Key, meta: &Meta, archive: &Path) -> Result<(), CacheError> {
         let (archive_path, meta_path) = self.checked_paths(key)?;
         if meta.key != *key {
@@ -259,9 +325,16 @@ impl Store for Local {
             });
         }
         fs::create_dir_all(&self.dir)?;
-        let _lock = self.lock(Lock::Exclusive)?;
         let staged_archive = self.stage_archive(key, archive)?;
         let staged_meta = self.stage_meta(key, meta)?;
+        #[cfg(test)]
+        if let Some(barrier) = &self.pause {
+            barrier.wait();
+            barrier.wait();
+        }
+        let _lock = self.lock(Lock::Exclusive)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "the cache directory disappeared")
+        })?;
         existing(fs::remove_file(&meta_path))?;
         staged_archive.persist(&archive_path)?;
         staged_meta.persist(&meta_path)?;
@@ -289,6 +362,31 @@ fn verify(key: &Key, meta_bytes: &[u8], archive: &mut fs::File) -> Result<Meta, 
         });
     }
     Ok(meta)
+}
+
+fn create_lock(path: &Path) -> io::Result<fs::File> {
+    fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+fn is_read_only(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    )
+}
+
+/// Removes a file, link or whole directory without following links.
+fn remove_path(path: &Path) -> io::Result<()> {
+    let removed = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        _ => fs::remove_file(path),
+    };
+    existing(removed).map(drop)
 }
 
 /// Keys become file names, so they must not contain separators, dots or `..`.
@@ -326,9 +424,7 @@ mod tests {
     }
 
     fn age(path: &Path, secs: u64) {
-        fs::File::options()
-            .write(true)
-            .open(path)
+        fs::File::open(path)
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(secs))
             .unwrap();
@@ -528,5 +624,104 @@ mod tests {
         fs::write(store.paths(&Key("k2".into())).0, "orphan").unwrap();
         assert_eq!(store.evict(u64::MAX).unwrap(), 0);
         assert_eq!(names(&store), [".lock", "k1.json", "k1.tar.zst"]);
+    }
+
+    #[test]
+    fn eviction_sweeps_only_temp_files_older_than_an_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        put(&store, &Key("k1".into()), "x");
+        let scratch = dir.path().join(TMP_DIR);
+        fs::create_dir_all(scratch.join("1-0/new")).unwrap();
+        for path in [
+            store.dir().join(".k2.json.1-0.tmp"),
+            store.dir().join(".k3.json.1-1.tmp"),
+            scratch.join("1-1.tar.zst"),
+            scratch.join("1-2.tar.zst"),
+        ] {
+            fs::write(path, "partial").unwrap();
+        }
+        age(&store.dir().join(".k3.json.1-1.tmp"), 2 * 3600);
+        age(&scratch.join("1-2.tar.zst"), 2 * 3600);
+        age(&scratch.join("1-0"), 2 * 3600);
+        store.evict(u64::MAX).unwrap();
+        assert_eq!(
+            names(&store),
+            [".k2.json.1-0.tmp", ".lock", "k1.json", "k1.tar.zst"]
+        );
+        let left = fs::read_dir(&scratch)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(left, ["1-1.tar.zst"]);
+    }
+
+    #[test]
+    fn a_slow_put_does_not_block_gets_of_other_keys() {
+        use std::sync::{Arc, Barrier, mpsc};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        let (k1, k2) = (Key("k1".into()), Key("k2".into()));
+        put(&store, &k1, "ready");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let slow = Local {
+            pause: Some(barrier.clone()),
+            ..store.clone()
+        };
+        let (src, meta, packed) = staged(&k2, "slow");
+        let writer = std::thread::spawn(move || {
+            let _src = src;
+            slow.put(&k2, &meta, packed.path()).map(drop)
+        });
+        barrier.wait();
+        let (tx, rx) = mpsc::channel();
+        let reader = store.clone();
+        std::thread::spawn(move || tx.send(reader.get(&k1).map(|e| e.is_some())).unwrap());
+        let got = rx.recv_timeout(Duration::from_secs(10));
+        barrier.wait();
+        assert!(matches!(got, Ok(Ok(true))), "{got:?}");
+        writer.join().unwrap().unwrap();
+        assert!(store.get(&Key("k2".into())).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_caches_still_serve_gets() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        let key = Key("k1".into());
+        put(&store, &key, "hello");
+        let mode = |path: &Path, mode| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(&store.dir().join(LOCK), 0o444);
+        mode(store.dir(), 0o555);
+        let got = store.get(&key);
+        mode(store.dir(), 0o755);
+        assert_eq!(restored(got.unwrap().unwrap()), "hello");
+    }
+
+    #[test]
+    fn clean_removes_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        put(&store, &Key("k1".into()), "x");
+        fs::create_dir_all(store.dir().join("sub/deeper")).unwrap();
+        fs::write(store.dir().join("sub/deeper/x"), "x").unwrap();
+        store.clean().unwrap();
+        assert_eq!(names(&store), [".lock"]);
+    }
+
+    #[test]
+    fn put_fails_when_the_lock_cannot_be_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        fs::create_dir_all(store.dir().join(LOCK)).unwrap();
+        let key = Key("k1".into());
+        let (_src, meta, packed) = staged(&key, "x");
+        assert!(store.put(&key, &meta, packed.path()).is_err());
+        assert_eq!(names(&store), [".lock"]);
     }
 }

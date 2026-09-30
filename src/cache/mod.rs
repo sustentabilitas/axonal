@@ -106,6 +106,7 @@ pub trait Store: Send + Sync {
     /// `Ok(None)` is a miss. Corrupt entries are errors, so they can be reported, and are
     /// removed.
     fn get(&self, key: &Key) -> Result<Option<Entry>, CacheError>;
-    /// Moves the archive file at `archive`, described by `meta`, into the store.
+    /// Moves the archive file at `archive`, described by `meta`, into the store. The file
+    /// is consumed even if the put fails.
     fn put(&self, key: &Key, meta: &Meta, archive: &Path) -> Result<(), CacheError>;
 }
