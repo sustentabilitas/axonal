@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fmt,
     path::{Path, PathBuf},
     process::Command,
@@ -156,18 +157,22 @@ fn probe(tool: &str, args: &[&str]) -> String {
         .unwrap_or_else(|| "missing".into())
 }
 
+/// Looks up an environment variable; production callers pass `std::env::var_os`.
+pub type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
 /// Cache keys for every task in `graph`, computed dependencies first.
 pub fn task_keys(
     ws: &Workspace,
     graph: &TaskGraph,
     files: &mut FileHashCache,
     tools: &Toolchain,
+    env: Env<'_>,
 ) -> Result<BTreeMap<TaskId, Key>> {
     graph
         .order
         .iter()
         .try_fold(BTreeMap::new(), |mut keys, id| {
-            let key = hash_task(ws, id, &graph.deps[id], &keys, files, tools)?;
+            let key = hash_task(ws, id, &graph.deps[id], &keys, files, tools, env)?;
             keys.insert(id.clone(), key);
             Ok(keys)
         })
@@ -180,24 +185,23 @@ fn hash_task(
     keys: &BTreeMap<TaskId, Key>,
     files: &mut FileHashCache,
     tools: &Toolchain,
+    env: Env<'_>,
 ) -> Result<Key> {
     let project = &ws.projects[&id.project];
     let target = ws.target(id);
-    let mut fields = Fields(blake3::Hasher::new());
+    let mut fields = Fields::new();
     fields
         .add("format", "axonal-task-v1")
         .add("project", &project.name)
-        .add("root", &display_root(&project.root))
+        .add("root", display_root(&project.root))
         .add("target", &id.target)
         .add(
             "config",
-            &serde_json::to_string(target).expect("targets serialize"),
+            serde_json::to_string(target).expect("targets serialize"),
         );
     for path in input_files(ws, project, target)? {
         let hash = files.hash(&ws.root, &path)?;
-        fields
-            .add("input", &path.to_string_lossy())
-            .add("content", &hash);
+        fields.add("input", path_bytes(&path)).add("content", hash);
     }
     if target.deps_usage != DepsUsage::None {
         let patterns = Patterns::new(&target.inputs)?;
@@ -207,14 +211,17 @@ fn hash_task(
             for path in owned_matches(dep, &patterns) {
                 let hash = files.hash(&ws.root, path)?;
                 fields
-                    .add("dep_input", &path.to_string_lossy())
-                    .add("content", &hash);
+                    .add("dep_input", path_bytes(path))
+                    .add("content", hash);
             }
         }
     }
     for var in target.env.iter().collect::<BTreeSet<_>>() {
-        let value = std::env::var(var).map_or_else(|_| "unset".into(), |v| format!("set:{v}"));
-        fields.add("env", var).add("value", &value);
+        fields.add("env", var);
+        match env(var) {
+            Some(value) => fields.add("set", value.as_encoded_bytes()),
+            None => fields.add("unset", ""),
+        };
     }
     for dep in deps {
         fields.add("dep", &keys[dep].0);
@@ -225,20 +232,33 @@ fn hash_task(
     fields
         .add("os", std::env::consts::OS)
         .add("arch", std::env::consts::ARCH);
-    Ok(Key(fields.0.finalize().to_hex().to_string()))
+    Ok(Key(fields.finish()))
 }
 
 /// Length-prefixed fields, so no two different field lists hash the same bytes.
 struct Fields(blake3::Hasher);
 
 impl Fields {
-    fn add(&mut self, name: &str, value: &str) -> &mut Self {
-        for part in [name, value] {
+    fn new() -> Self {
+        Self(blake3::Hasher::new())
+    }
+
+    fn add(&mut self, name: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> &mut Self {
+        for part in [name.as_ref(), value.as_ref()] {
             self.0.update(&(part.len() as u64).to_le_bytes());
-            self.0.update(part.as_bytes());
+            self.0.update(part);
         }
         self
     }
+
+    fn finish(&self) -> String {
+        self.0.finalize().to_hex().to_string()
+    }
+}
+
+/// A path's platform bytes, so distinct non-UTF-8 paths never hash alike.
+fn path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_encoded_bytes()
 }
 
 /// Files `project` owns that match the project-relative globs. Only owned files, so a
@@ -269,17 +289,10 @@ pub fn input_files(ws: &Workspace, project: &Project, target: &Target) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        fs,
-        sync::{Mutex, MutexGuard, PoisonError},
-    };
+    use std::fs;
 
-    /// Held by every test that computes keys, since `CONFIG` lists `AXONAL_HASH_TEST_MODE`
-    /// and `listed_env_vars_change_keys` sets it.
-    static ENV: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV.lock().unwrap_or_else(PoisonError::into_inner)
+    fn no_env(_: &str) -> Option<OsString> {
+        None
     }
 
     fn write(root: &Path, rel: &str, body: &str) {
@@ -324,7 +337,7 @@ command = "fmt b"
         dir
     }
 
-    fn keys(root: &Path) -> (String, String) {
+    fn keys_with(root: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> (String, String) {
         let ws = Workspace::discover(root).unwrap();
         let graph = TaskGraph::build(&ws, &["build".into()], None).unwrap();
         let keys = task_keys(
@@ -332,6 +345,7 @@ command = "fmt b"
             &graph,
             &mut FileHashCache::default(),
             &Toolchain::default(),
+            env,
         )
         .unwrap();
         (
@@ -340,16 +354,18 @@ command = "fmt b"
         )
     }
 
+    fn keys(root: &Path) -> (String, String) {
+        keys_with(root, &no_env)
+    }
+
     #[test]
     fn keys_are_stable() {
-        let _env = env_lock();
         let dir = fixture();
         assert_eq!(keys(dir.path()), keys(dir.path()));
     }
 
     #[test]
     fn input_changes_propagate_to_dependents() {
-        let _env = env_lock();
         let dir = fixture();
         let (a, b) = keys(dir.path());
         write(dir.path(), "libs/a/src/a.txt", "a2");
@@ -358,7 +374,12 @@ command = "fmt b"
         assert_ne!(b, b2);
     }
 
-    fn key_of(root: &Path, target: &str, project: &str) -> String {
+    fn key_with(
+        root: &Path,
+        target: &str,
+        project: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> String {
         let ws = Workspace::discover(root).unwrap();
         let graph = TaskGraph::build(&ws, &[target.into()], None).unwrap();
         let keys = task_keys(
@@ -366,9 +387,14 @@ command = "fmt b"
             &graph,
             &mut FileHashCache::default(),
             &Toolchain::default(),
+            env,
         )
         .unwrap();
         keys[&TaskId::new(project, target)].0.clone()
+    }
+
+    fn key_of(root: &Path, target: &str, project: &str) -> String {
+        key_with(root, target, project, &no_env)
     }
 
     #[test]
@@ -395,7 +421,6 @@ command = "fmt b"
 
     #[test]
     fn non_inputs_do_not_change_keys() {
-        let _env = env_lock();
         let dir = fixture();
         let before = keys(dir.path());
         write(dir.path(), "libs/a/README.md", "new docs");
@@ -404,7 +429,6 @@ command = "fmt b"
 
     #[test]
     fn workspace_inputs_change_every_key() {
-        let _env = env_lock();
         let dir = fixture();
         let (a, b) = keys(dir.path());
         write(dir.path(), "shared.cfg", "y");
@@ -413,16 +437,59 @@ command = "fmt b"
         assert_ne!(b, b2);
     }
 
+    fn mode(value: OsString) -> impl Fn(&str) -> Option<OsString> {
+        move |name| (name == "AXONAL_HASH_TEST_MODE").then(|| value.clone())
+    }
+
     #[test]
     fn listed_env_vars_change_keys() {
-        let _env = env_lock();
         let dir = fixture();
-        let before = keys(dir.path());
-        // SAFETY: every other reader of AXONAL_HASH_TEST_MODE holds `ENV`.
-        unsafe { std::env::set_var("AXONAL_HASH_TEST_MODE", "ci") };
-        let after = keys(dir.path());
-        unsafe { std::env::remove_var("AXONAL_HASH_TEST_MODE") };
-        assert_ne!(before, after);
+        let unset = keys(dir.path());
+        let empty = keys_with(dir.path(), &mode("".into()));
+        let ci = keys_with(dir.path(), &mode("ci".into()));
+        assert_ne!(unset, empty, "unset differs from empty");
+        assert_ne!(empty, ci);
+        assert_eq!(ci, keys_with(dir.path(), &mode("ci".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_env_values_are_hashed_as_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = fixture();
+        let bytes = |b: &[u8]| mode(std::ffi::OsStr::from_bytes(b).to_os_string());
+        let one = keys_with(dir.path(), &bytes(b"\xff1"));
+        assert_ne!(one, keys_with(dir.path(), &bytes(b"\xff2")));
+        assert_ne!(one, keys(dir.path()));
+    }
+
+    #[test]
+    fn unusual_env_names_do_not_panic_with_the_process_env() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.\"libs/a\".targets.build]\ncommand = \"make\"\nenv = [\"\", \"A=B\", \"X\\u0000Y\"]\n",
+        );
+        write(dir.path(), "libs/a/src/a.txt", "a");
+        key_with(dir.path(), "build", "libs/a", &|name| {
+            std::env::var_os(name)
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_are_hashed_as_raw_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let digest = |name: &[u8]| {
+            let mut fields = Fields::new();
+            fields.add(
+                "input",
+                path_bytes(Path::new(std::ffi::OsStr::from_bytes(name))),
+            );
+            fields.finish()
+        };
+        assert_ne!(digest(b"src/\xff"), digest(b"src/\xfe"));
     }
 
     #[test]
