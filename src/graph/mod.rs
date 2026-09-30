@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 pub use crate::files::display_root;
 use crate::{
@@ -69,6 +69,7 @@ impl Target {
 #[derive(Debug, Clone, Serialize)]
 pub struct Project {
     pub name: String,
+    #[serde(serialize_with = "serialize_root")]
     pub root: PathBuf,
     pub kinds: BTreeSet<Kind>,
     pub deps: BTreeSet<String>,
@@ -82,6 +83,10 @@ pub struct Project {
     /// Files this project owns (deepest root wins), workspace-relative and sorted.
     #[serde(skip)]
     pub files: Vec<PathBuf>,
+}
+
+fn serialize_root<S: Serializer>(root: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&display_root(root))
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +254,8 @@ impl Workspace {
 
     /// Projects whose changes can affect `name`: its deps and dev-deps, then their deps
     /// transitively (a dependency's dev-deps don't count). Never includes `name` itself.
+    ///
+    /// Panics if `name` isn't a project; check user input with [`Self::check_projects`].
     pub fn dependency_closure(&self, name: &str) -> BTreeSet<&str> {
         let project = &self.projects[name];
         let mut seen = BTreeSet::new();
@@ -376,18 +383,28 @@ fn resolve_targets(
         .collect()
 }
 
+/// A quoted DOT ID: only `\` and `"` need escaping.
+fn dot_id(id: &str) -> String {
+    format!("\"{}\"", id.replace('\\', r"\\").replace('"', r#"\""#))
+}
+
+/// Dev edges are dashed.
 pub fn to_dot(ws: &Workspace) -> String {
     let body: String = ws
         .projects
         .values()
         .map(|p| {
-            std::iter::once(format!("  {:?};\n", p.name))
-                .chain(
-                    p.deps
-                        .iter()
-                        .map(|d| format!("  {:?} -> {:?};\n", p.name, d)),
-                )
-                .collect::<String>()
+            let from = dot_id(&p.name);
+            let edges = |deps: &BTreeSet<String>, attrs: &str| {
+                deps.iter()
+                    .map(|d| format!("  {from} -> {}{attrs};\n", dot_id(d)))
+                    .collect::<String>()
+            };
+            format!(
+                "  {from};\n{}{}",
+                edges(&p.deps, ""),
+                edges(&p.dev_deps, " [style=dashed]")
+            )
         })
         .collect();
     format!("digraph axonal {{\n{body}}}\n")
@@ -800,6 +817,34 @@ command = "true"
             to_dot(&ws),
             "digraph axonal {\n  \"app\";\n  \"app\" -> \"lib\";\n  \"lib\";\n}\n"
         );
+    }
+
+    #[test]
+    fn dot_ids_escape_only_backslashes_and_quotes() {
+        assert_eq!(dot_id("@acme/ui"), r#""@acme/ui""#);
+        assert_eq!(dot_id(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(dot_id("café\t"), "\"café\t\"");
+    }
+
+    #[test]
+    fn dot_draws_dev_edges_dashed() {
+        let mut core = testing::project("core", &[], &[]);
+        core.dev_deps = BTreeSet::from(["test-utils".to_string()]);
+        let ws = testing::workspace(vec![core, testing::project("test-utils", &["core"], &[])]);
+        assert_eq!(
+            to_dot(&ws),
+            "digraph axonal {\n  \"core\";\n  \"core\" -> \"test-utils\" [style=dashed];\n  \"test-utils\";\n  \"test-utils\" -> \"core\";\n}\n"
+        );
+    }
+
+    #[test]
+    fn the_root_serialises_as_dot() {
+        let mut root = testing::project("root", &[], &[]);
+        root.root = PathBuf::new();
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["root"], ".");
+        let lib = serde_json::to_value(testing::project("libs/a", &[], &[])).unwrap();
+        assert_eq!(lib["root"], "libs/a");
     }
 
     #[test]
