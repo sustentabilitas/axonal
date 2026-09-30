@@ -16,6 +16,7 @@ blake3 = "1.8"
 clap = { version = "4.6", features = ["derive"] }
 globset = "0.4"
 ignore = "0.4"
+jev = "0.1"
 oxc_allocator = "0.152"
 oxc_parser = "0.152"
 oxc_span = "0.152"
@@ -26,7 +27,7 @@ serde_norway = "0.9"
 tap = "1"
 tar = "0.4"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync"] }
+tokio = { version = "1.0", features = ["full"] }
 toml = "1"
 zstd = "0.14"
 
