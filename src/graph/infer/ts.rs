@@ -2,7 +2,7 @@
 //! `paths`, relative paths and workspace package names.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -19,6 +19,7 @@ const MAX_EXTENDS: usize = 16;
 
 /// Strips `//` and `/* */` comments and trailing commas so tsconfig files parse as JSON.
 pub fn strip_jsonc(src: &str) -> String {
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let mut out = String::with_capacity(src.len());
     let mut chars = src.chars().peekable();
     let mut in_string = false;
@@ -102,37 +103,38 @@ struct CompilerOptions {
 }
 
 impl TsPaths {
-    /// Reads `tsconfig.base.json` (else `tsconfig.json`) at `root`. The nearest file in the
-    /// `extends` chain that sets `paths` (or `baseUrl`) wins, as in TypeScript.
+    /// Reads `tsconfig.base.json` (else `tsconfig.json`) at `root` and its relative `extends`.
+    /// As in TypeScript, a file beats the files it extends and later `extends` entries beat
+    /// earlier ones; the highest-ranked file that sets `paths` (or `baseUrl`) wins.
     pub fn load(root: &Path) -> Result<TsPaths> {
         let mut chain: Vec<(PathBuf, TsConfig)> = Vec::new();
-        let mut next = ROOT_CONFIGS
+        let mut visited = BTreeSet::new();
+        let mut pending: Vec<PathBuf> = ROOT_CONFIGS
             .into_iter()
             .map(PathBuf::from)
-            .find(|f| root.join(f).is_file());
-        while let Some(rel) = next.take().filter(|_| chain.len() < MAX_EXTENDS) {
+            .find(|f| root.join(f).is_file())
+            .into_iter()
+            .collect();
+        // Depth-first with the last `extends` entry popped first yields highest rank first.
+        while let Some(rel) = pending.pop().filter(|_| chain.len() < MAX_EXTENDS) {
+            if !visited.insert(rel.clone()) {
+                continue;
+            }
             let path = root.join(&rel);
-            let config: TsConfig = serde_json::from_str(&strip_jsonc(&std::fs::read_to_string(
-                &path,
-            )?))
-            .map_err(|e| Error::Config {
+            let config_error = |message: String| Error::Config {
                 path: path.clone(),
-                message: e.to_string(),
-            })?;
+                message,
+            };
+            let src = std::fs::read_to_string(&path).map_err(|e| config_error(e.to_string()))?;
+            let config: TsConfig = serde_json::from_str(&strip_jsonc(&src))
+                .map_err(|e| config_error(e.to_string()))?;
             let dir = rel.parent().map(Path::to_path_buf).unwrap_or_default();
-            next = config
-                .extends
-                .as_ref()
-                .and_then(extends_path)
-                .filter(|e| e.starts_with('.'))
-                .and_then(|e| {
-                    let file = if e.ends_with(".json") {
-                        e.to_string()
-                    } else {
-                        format!("{e}.json")
-                    };
-                    files::normalize(&dir.join(file))
-                });
+            pending.extend(
+                config
+                    .extends
+                    .iter()
+                    .flat_map(|extends| relative_extends(extends, &dir)),
+            );
             chain.push((dir, config));
         }
         let paths = chain
@@ -150,11 +152,27 @@ impl TsPaths {
         }))
     }
 
-    /// Workspace-relative candidate paths for a bare specifier.
+    /// Workspace-relative candidate paths for a bare specifier, from the single pattern
+    /// TypeScript would pick: an exact alias, else the wildcard with the longest prefix.
     pub fn resolve(&self, spec: &str) -> Vec<PathBuf> {
-        self.aliases
+        let exact = self
+            .aliases
             .iter()
-            .filter_map(|(pattern, targets)| capture(pattern, spec).map(|star| (targets, star)))
+            .find(|(pattern, _)| pattern == spec)
+            .map(|(_, targets)| (targets, ""));
+        let chosen = exact.or_else(|| {
+            self.aliases
+                .iter()
+                .filter_map(|(pattern, targets)| {
+                    let (prefix, suffix) = pattern.split_once('*')?;
+                    let star = spec.strip_prefix(prefix)?.strip_suffix(suffix)?;
+                    Some((prefix.len(), targets, star))
+                })
+                .max_by_key(|(prefix_len, ..)| *prefix_len)
+                .map(|(_, targets, star)| (targets, star))
+        });
+        chosen
+            .into_iter()
             .flat_map(|(targets, star)| {
                 targets.iter().filter_map(move |t| {
                     files::normalize(&self.base.join(t.replacen('*', star, 1)))
@@ -164,19 +182,24 @@ impl TsPaths {
     }
 }
 
-fn extends_path(value: &Value) -> Option<&str> {
-    match value {
-        Value::String(s) => Some(s),
-        Value::Array(items) => items.iter().rev().find_map(Value::as_str),
-        _ => None,
-    }
-}
-
-fn capture<'s>(pattern: &str, spec: &'s str) -> Option<&'s str> {
-    match pattern.split_once('*') {
-        None => (pattern == spec).then_some(""),
-        Some((prefix, suffix)) => spec.strip_prefix(prefix)?.strip_suffix(suffix),
-    }
+/// Workspace-relative files named by the relative entries of an `extends` string or array.
+fn relative_extends<'a>(value: &'a Value, dir: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
+    let entries = match value {
+        Value::Array(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    entries
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|e| e.starts_with('.'))
+        .filter_map(move |e| {
+            let file = if e.ends_with(".json") {
+                e.to_string()
+            } else {
+                format!("{e}.json")
+            };
+            files::normalize(&dir.join(file))
+        })
 }
 
 #[cfg(test)]
@@ -262,5 +285,112 @@ mod tests {
             TsPaths::load(dir.path()),
             Err(Error::Config { .. })
         ));
+    }
+
+    #[test]
+    fn strips_a_leading_byte_order_mark() {
+        let v: serde_json::Value =
+            serde_json::from_str(&strip_jsonc("\u{feff}{ \"a\": 1 }")).unwrap();
+        assert_eq!(v["a"], 1);
+    }
+
+    fn aliases(entries: &[(&str, &[&str])]) -> TsPaths {
+        TsPaths {
+            base: PathBuf::new(),
+            aliases: entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.iter().map(|t| t.to_string()).collect()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_uses_the_longest_wildcard_prefix_only() {
+        let paths = aliases(&[
+            ("*", &["types/*"]),
+            ("@acme/*", &["libs/*"]),
+            ("@acme/feat/*", &["feat/*/src"]),
+        ]);
+        assert_eq!(
+            paths.resolve("@acme/feat/a"),
+            vec![PathBuf::from("feat/a/src")]
+        );
+        assert_eq!(paths.resolve("@acme/x"), vec![PathBuf::from("libs/x")]);
+        assert_eq!(paths.resolve("react"), vec![PathBuf::from("types/react")]);
+    }
+
+    #[test]
+    fn exact_alias_beats_wildcards() {
+        let paths = aliases(&[
+            ("@acme/*", &["libs/*"]),
+            ("@acme/money", &["money/index.ts"]),
+        ]);
+        assert_eq!(
+            paths.resolve("@acme/money"),
+            vec![PathBuf::from("money/index.ts")]
+        );
+    }
+
+    #[test]
+    fn array_extends_skips_package_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{ "extends": ["./paths.json", "@tsconfig/node20/tsconfig.json"] }"#,
+        );
+        write(
+            dir.path(),
+            "paths.json",
+            r#"{ "compilerOptions": { "paths": { "@x": ["x/index.ts"] } } }"#,
+        );
+        let paths = TsPaths::load(dir.path()).unwrap();
+        assert_eq!(paths.resolve("@x"), vec![PathBuf::from("x/index.ts")]);
+    }
+
+    #[test]
+    fn later_array_extends_entries_take_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{ "extends": ["./a.json", "./b.json"] }"#,
+        );
+        write(
+            dir.path(),
+            "a.json",
+            r#"{ "compilerOptions": { "baseUrl": "a", "paths": { "@a": ["a.ts"] } } }"#,
+        );
+        write(
+            dir.path(),
+            "b.json",
+            r#"{ "compilerOptions": { "paths": { "@b": ["b.ts"] } } }"#,
+        );
+        let paths = TsPaths::load(dir.path()).unwrap();
+        assert!(paths.resolve("@a").is_empty());
+        assert_eq!(paths.resolve("@b"), vec![PathBuf::from("a/b.ts")]);
+    }
+
+    #[test]
+    fn extends_cycles_terminate() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{ "extends": "./a", "compilerOptions": { "paths": { "@x": ["x.ts"] } } }"#,
+        );
+        write(dir.path(), "a.json", r#"{ "extends": "./tsconfig.json" }"#);
+        let paths = TsPaths::load(dir.path()).unwrap();
+        assert_eq!(paths.resolve("@x"), vec![PathBuf::from("x.ts")]);
+    }
+
+    #[test]
+    fn missing_extends_is_a_config_error_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "tsconfig.json", r#"{ "extends": "./missing" }"#);
+        match TsPaths::load(dir.path()) {
+            Err(Error::Config { path, .. }) => assert!(path.ends_with("missing.json")),
+            other => panic!("expected a config error, got {other:?}"),
+        }
     }
 }
