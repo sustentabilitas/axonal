@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -17,12 +18,17 @@ use crate::{
 pub struct Crate {
     pub name: String,
     pub root: PathBuf,
-    /// Workspace-relative roots of member crates this one depends on by path.
+    /// Workspace-relative roots of member crates this one depends on by path
+    /// as a normal or build dependency.
     pub path_deps: BTreeSet<PathBuf>,
+    /// Member crates depended on by path only as dev-dependencies. Cargo allows
+    /// these to form cycles, so they must never order tasks.
+    pub dev_path_deps: BTreeSet<PathBuf>,
 }
 
 #[derive(Deserialize)]
 struct Metadata {
+    workspace_root: PathBuf,
     packages: Vec<Package>,
 }
 
@@ -37,6 +43,21 @@ struct Package {
 #[derive(Deserialize)]
 struct Dependency {
     path: Option<PathBuf>,
+    /// `None` for normal dependencies, otherwise `"build"` or `"dev"`.
+    kind: Option<String>,
+}
+
+impl Dependency {
+    fn is_dev(&self) -> bool {
+        self.kind.as_deref() == Some("dev")
+    }
+}
+
+fn tool_error(message: String) -> Error {
+    Error::Tool {
+        tool: "cargo metadata".into(),
+        message,
+    }
 }
 
 /// `root` must be canonical: `cargo metadata` reports canonical paths.
@@ -44,21 +65,34 @@ pub fn discover(root: &Path) -> Result<Vec<Crate>> {
     if !root.join("Cargo.toml").is_file() {
         return Ok(Vec::new());
     }
-    let tool = |message: String| Error::Tool {
-        tool: "cargo metadata".into(),
-        message,
-    };
     let out = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
         .output()
-        .map_err(|e| tool(e.to_string()))?;
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => tool_error("cargo not found on PATH".into()),
+            _ => tool_error(e.to_string()),
+        })?;
     if !out.status.success() {
-        return Err(tool(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ));
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(tool_error(if stderr.is_empty() {
+            out.status.to_string()
+        } else {
+            stderr
+        }));
     }
-    let meta: Metadata = serde_json::from_slice(&out.stdout).map_err(|e| tool(e.to_string()))?;
+    parse(root, &out.stdout)
+}
+
+fn parse(root: &Path, stdout: &[u8]) -> Result<Vec<Crate>> {
+    let meta: Metadata = serde_json::from_slice(stdout).map_err(|e| tool_error(e.to_string()))?;
+    if meta.workspace_root != root {
+        return Err(tool_error(format!(
+            "Cargo workspace root is {}, expected {}",
+            meta.workspace_root.display(),
+            root.display()
+        )));
+    }
     Ok(from_metadata(root, meta))
 }
 
@@ -73,16 +107,29 @@ fn from_metadata(root: &Path, meta: Metadata) -> Vec<Crate> {
         .into_iter()
         .filter_map(|p| {
             let crate_root = p.manifest_path.parent().and_then(relative)?;
-            let path_deps = p
+            let member_deps: Vec<(bool, PathBuf)> = p
                 .dependencies
                 .iter()
-                .filter_map(|d| d.path.as_deref().and_then(relative))
-                .filter(|d| members.contains(d))
+                .filter_map(|d| {
+                    let path = d.path.as_deref().and_then(relative)?;
+                    members.contains(&path).then_some((d.is_dev(), path))
+                })
+                .collect();
+            let path_deps: BTreeSet<PathBuf> = member_deps
+                .iter()
+                .filter(|(is_dev, _)| !is_dev)
+                .map(|(_, path)| path.clone())
+                .collect();
+            let dev_path_deps = member_deps
+                .into_iter()
+                .filter(|(is_dev, path)| *is_dev && !path_deps.contains(path))
+                .map(|(_, path)| path)
                 .collect();
             Some(Crate {
                 name: p.name,
                 root: crate_root,
                 path_deps,
+                dev_path_deps,
             })
         })
         .collect()
@@ -123,24 +170,89 @@ mod tests {
 
     #[test]
     fn members_and_path_deps_come_from_metadata() {
-        let meta: Metadata = serde_json::from_value(serde_json::json!({"packages": [
-            {"name": "core", "manifest_path": "/ws/crates/core/Cargo.toml",
-             "dependencies": [{"name": "serde"}]},
-            {"name": "cli", "manifest_path": "/ws/crates/cli/Cargo.toml",
-             "dependencies": [{"name": "core", "path": "/ws/crates/core"},
-                              {"name": "vendored", "path": "/elsewhere/vendored"}]}
-        ]}))
+        let meta: Metadata = serde_json::from_value(serde_json::json!({
+            "workspace_root": "/ws",
+            "packages": [
+                {"name": "core", "manifest_path": "/ws/crates/core/Cargo.toml",
+                 "dependencies": [{"name": "serde", "kind": null}]},
+                {"name": "gen", "manifest_path": "/ws/crates/gen/Cargo.toml"},
+                {"name": "utils", "manifest_path": "/ws/crates/utils/Cargo.toml"},
+                {"name": "cli", "manifest_path": "/ws/crates/cli/Cargo.toml",
+                 "dependencies": [
+                     {"name": "core", "path": "/ws/crates/core", "kind": null},
+                     {"name": "core", "path": "/ws/crates/core", "kind": "dev"},
+                     {"name": "gen", "path": "/ws/crates/gen", "kind": "build"},
+                     {"name": "utils", "path": "/ws/crates/utils", "kind": "dev"},
+                     {"name": "vendored", "path": "/elsewhere/vendored", "kind": null}
+                 ]}
+            ]
+        }))
         .unwrap();
         let crates = from_metadata(Path::new("/ws"), meta);
         assert!(crates[0].path_deps.is_empty());
+        assert!(crates[0].dev_path_deps.is_empty());
         assert_eq!(
-            crates[1],
+            crates[3],
             Crate {
                 name: "cli".into(),
                 root: "crates/cli".into(),
-                path_deps: BTreeSet::from([PathBuf::from("crates/core")]),
+                path_deps: BTreeSet::from([
+                    PathBuf::from("crates/core"),
+                    PathBuf::from("crates/gen")
+                ]),
+                dev_path_deps: BTreeSet::from([PathBuf::from("crates/utils")]),
             }
         );
+    }
+
+    #[test]
+    fn a_different_workspace_root_is_a_tool_error() {
+        let out = serde_json::to_vec(&serde_json::json!({
+            "workspace_root": "/parent",
+            "packages": [{"name": "core", "manifest_path": "/parent/ws/Cargo.toml"}]
+        }))
+        .unwrap();
+        let err = parse(Path::new("/parent/ws"), &out).unwrap_err();
+        assert!(
+            matches!(&err, Error::Tool { message, .. }
+                if message == "Cargo workspace root is /parent, expected /parent/ws"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_cycles_stay_out_of_path_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"3\"\n",
+        );
+        write(
+            dir.path(),
+            "crates/a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dev-dependencies]\nb = { path = \"../b\" }\n",
+        );
+        write(dir.path(), "crates/a/src/lib.rs", "");
+        write(
+            dir.path(),
+            "crates/b/Cargo.toml",
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n",
+        );
+        write(dir.path(), "crates/b/src/lib.rs", "");
+        let root = dir.path().canonicalize().unwrap();
+        let mut crates = discover(&root).unwrap();
+        crates.sort_by(|x, y| x.name.cmp(&y.name));
+        assert!(crates[0].path_deps.is_empty());
+        assert_eq!(
+            crates[0].dev_path_deps,
+            BTreeSet::from([PathBuf::from("crates/b")])
+        );
+        assert_eq!(
+            crates[1].path_deps,
+            BTreeSet::from([PathBuf::from("crates/a")])
+        );
+        assert!(crates[1].dev_path_deps.is_empty());
     }
 
     #[test]
