@@ -250,8 +250,17 @@ impl Workspace {
             .collect()
     }
 
+    pub fn get_target(&self, id: &TaskId) -> Option<&Target> {
+        self.projects.get(&id.project)?.targets.get(&id.target)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `id` isn't a task in this workspace; use [`Self::get_target`] for
+    /// unchecked ids.
     pub fn target(&self, id: &TaskId) -> &Target {
-        &self.projects[&id.project].targets[&id.target]
+        self.get_target(id)
+            .expect("the task exists in the workspace")
     }
 
     pub fn check_projects(&self, names: &BTreeSet<String>) -> Result<()> {

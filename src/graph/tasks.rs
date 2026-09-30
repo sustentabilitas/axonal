@@ -1,7 +1,7 @@
 //! The task graph: `project:target` tasks and the edges `depends_on` implies.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt,
 };
 
@@ -75,16 +75,21 @@ impl TaskGraph {
     }
 
     pub fn from_roots(ws: &Workspace, roots: Vec<TaskId>) -> Result<TaskGraph> {
+        if let Some(unknown) = roots.iter().find(|id| ws.get_target(id).is_none()) {
+            return Err(Error::UnknownTask(unknown.to_string()));
+        }
+        let mut upstream_cache = UpstreamCache::new();
         let mut deps = BTreeMap::new();
         let mut stack = roots;
         while let Some(id) = stack.pop() {
             if deps.contains_key(&id) {
                 continue;
             }
-            let task_deps = task_deps(ws, &id);
+            let task_deps = task_deps(ws, &id, &mut upstream_cache);
             stack.extend(task_deps.iter().cloned());
             deps.insert(id, task_deps);
         }
+        check_persistent(ws, &deps)?;
         let order = topo_order(&deps)?;
         Ok(TaskGraph { deps, order })
     }
@@ -94,13 +99,23 @@ impl TaskGraph {
     }
 }
 
-fn task_deps(ws: &Workspace, id: &TaskId) -> BTreeSet<TaskId> {
+/// `^target` results by `(project, target)`, shared by every task in one graph.
+type UpstreamCache<'a> = HashMap<(&'a str, &'a str), BTreeSet<TaskId>>;
+
+fn task_deps<'a>(
+    ws: &'a Workspace,
+    id: &TaskId,
+    upstream_cache: &mut UpstreamCache<'a>,
+) -> BTreeSet<TaskId> {
     let project = &ws.projects[&id.project];
     project.targets[&id.target]
         .depends_on
         .iter()
         .flat_map(|dep| match dep.strip_prefix('^') {
-            Some(target) => upstream(ws, project, target),
+            Some(target) => upstream_cache
+                .entry((project.name.as_str(), target))
+                .or_insert_with(|| upstream(ws, project, target))
+                .clone(),
             None => project
                 .targets
                 .contains_key(dep.as_str())
@@ -113,6 +128,8 @@ fn task_deps(ws: &Workspace, id: &TaskId) -> BTreeSet<TaskId> {
 
 /// `^target`: the target in each dependency, looking through dependencies that lack it.
 fn upstream(ws: &Workspace, project: &Project, target: &str) -> BTreeSet<TaskId> {
+    #[cfg(test)]
+    tests::record_upstream_lookup(&project.name, target);
     let mut found = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut stack: Vec<&str> = project.deps.iter().map(String::as_str).collect();
@@ -120,6 +137,7 @@ fn upstream(ws: &Workspace, project: &Project, target: &str) -> BTreeSet<TaskId>
         if !seen.insert(name) {
             continue;
         }
+        // `deps` names real projects, as `Workspace::discover` guarantees.
         let dep = &ws.projects[name];
         if dep.targets.contains_key(target) {
             found.insert(TaskId::new(name, target));
@@ -128,6 +146,19 @@ fn upstream(ws: &Workspace, project: &Project, target: &str) -> BTreeSet<TaskId>
         }
     }
     found
+}
+
+/// `run` would wait forever on a dependency that never finishes; persistent roots are fine.
+fn check_persistent(ws: &Workspace, deps: &BTreeMap<TaskId, BTreeSet<TaskId>>) -> Result<()> {
+    deps.iter()
+        .flat_map(|(id, ds)| ds.iter().map(move |d| (id, d)))
+        .find(|(_, d)| ws.target(d).persistent)
+        .map_or(Ok(()), |(task, dependency)| {
+            Err(Error::PersistentDependency {
+                task: task.to_string(),
+                dependency: dependency.to_string(),
+            })
+        })
 }
 
 fn invert(deps: &BTreeMap<TaskId, BTreeSet<TaskId>>) -> BTreeMap<TaskId, BTreeSet<TaskId>> {
@@ -194,6 +225,8 @@ fn find_cycle(deps: &BTreeMap<TaskId, BTreeSet<TaskId>>, ordered: &[TaskId]) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::graph::testing::{project, workspace};
 
@@ -278,11 +311,164 @@ mod tests {
         let Err(Error::Cycle(path)) = TaskGraph::build(&ws, &["build".into()], None) else {
             panic!("expected a cycle");
         };
-        assert!(
-            path.contains("a:build") && path.contains("b:build"),
-            "{path}"
+        assert_eq!(path, "a:build -> b:build -> a:build");
+    }
+
+    #[test]
+    fn a_self_dependency_is_a_cycle() {
+        let ws = workspace(vec![project("a", &[], &[("build", &["build"])])]);
+        assert!(matches!(
+            TaskGraph::build(&ws, &["build".into()], None),
+            Err(Error::Cycle(path)) if path == "a:build -> a:build"
+        ));
+    }
+
+    #[test]
+    fn dev_deps_never_order_tasks() {
+        let mut core = project(
+            "core",
+            &[],
+            &[("build", &["^build"]), ("test", &["build", "^build"])],
         );
-        assert_eq!(path.matches(" -> ").count(), 2, "{path}");
+        core.dev_deps = BTreeSet::from(["test-utils".to_string()]);
+        let ws = workspace(vec![
+            core,
+            project("test-utils", &["core"], &[("build", &["^build"])]),
+        ]);
+        let g = TaskGraph::build(&ws, &["build".into(), "test".into()], None).unwrap();
+        assert_eq!(
+            g.deps[&TaskId::new("core", "test")],
+            BTreeSet::from([TaskId::new("core", "build")])
+        );
+        assert_eq!(order(&g), ["core:build", "core:test", "test-utils:build"]);
+    }
+
+    #[test]
+    fn a_diamond_orders_the_shared_dependency_first() {
+        let ws = workspace(vec![
+            project("app", &["l1", "l2"], &[("build", &["^build"])]),
+            project("l1", &["util"], &[("build", &["^build"])]),
+            project("l2", &["util"], &[("build", &["^build"])]),
+            project("util", &[], &[("build", &[])]),
+        ]);
+        let g = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        assert_eq!(order(&g)[0], "util:build");
+        assert_eq!(g.deps[&TaskId::new("app", "build")].len(), 2);
+    }
+
+    #[test]
+    fn a_diamond_through_projects_without_the_target_gives_one_edge() {
+        let ws = workspace(vec![
+            project("app", &["l1", "l2"], &[("build", &["^build"])]),
+            project("l1", &["util"], &[]),
+            project("l2", &["util"], &[]),
+            project("util", &[], &[("build", &[])]),
+        ]);
+        let g = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        assert_eq!(
+            g.deps[&TaskId::new("app", "build")],
+            BTreeSet::from([TaskId::new("util", "build")])
+        );
+    }
+
+    #[test]
+    fn root_order_does_not_change_the_task_order() {
+        let roots = vec![
+            TaskId::new("app", "test"),
+            TaskId::new("lib", "build"),
+            TaskId::new("tool", "build"),
+            TaskId::new("util", "build"),
+        ];
+        let reversed = roots.iter().rev().cloned().collect();
+        assert_eq!(
+            TaskGraph::from_roots(&chain(), roots).unwrap().order,
+            TaskGraph::from_roots(&chain(), reversed).unwrap().order
+        );
+    }
+
+    fn persistent(mut p: Project, target: &str) -> Project {
+        p.targets
+            .get_mut(target)
+            .expect("the target exists")
+            .persistent = true;
+        p
+    }
+
+    #[test]
+    fn a_same_project_persistent_dependency_is_an_error() {
+        let ws = workspace(vec![persistent(
+            project("app", &[], &[("serve", &[]), ("e2e", &["serve"])]),
+            "serve",
+        )]);
+        assert!(matches!(
+            TaskGraph::build(&ws, &["e2e".into()], None),
+            Err(Error::PersistentDependency { task, dependency })
+                if task == "app:e2e" && dependency == "app:serve"
+        ));
+    }
+
+    #[test]
+    fn a_caret_persistent_dependency_is_an_error() {
+        let ws = workspace(vec![
+            project("app", &["api"], &[("dev", &["^serve"])]),
+            persistent(project("api", &[], &[("serve", &[])]), "serve"),
+        ]);
+        assert!(matches!(
+            TaskGraph::build(&ws, &["dev".into()], None),
+            Err(Error::PersistentDependency { task, dependency })
+                if task == "app:dev" && dependency == "api:serve"
+        ));
+    }
+
+    #[test]
+    fn persistent_roots_are_allowed() {
+        let ws = workspace(vec![persistent(
+            project("app", &[], &[("serve", &[])]),
+            "serve",
+        )]);
+        let g = TaskGraph::build(&ws, &["serve".into()], None).unwrap();
+        assert_eq!(order(&g), ["app:serve"]);
+    }
+
+    #[test]
+    fn from_roots_rejects_unknown_tasks() {
+        assert!(matches!(
+            TaskGraph::from_roots(&chain(), vec![TaskId::new("ghost", "build")]),
+            Err(Error::UnknownTask(t)) if t == "ghost:build"
+        ));
+        assert!(matches!(
+            TaskGraph::from_roots(&chain(), vec![TaskId::new("app", "deploy")]),
+            Err(Error::UnknownTask(t)) if t == "app:deploy"
+        ));
+    }
+
+    thread_local! {
+        static UPSTREAM_LOOKUPS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record_upstream_lookup(project: &str, target: &str) {
+        UPSTREAM_LOOKUPS.with(|l| l.borrow_mut().push((project.into(), target.into())));
+    }
+
+    #[test]
+    fn each_caret_lookup_is_resolved_once_per_graph() {
+        let ws = workspace(vec![
+            project(
+                "app",
+                &["lib"],
+                &[
+                    ("build", &["^build"]),
+                    ("lint", &["^build"]),
+                    ("test", &["^build"]),
+                ],
+            ),
+            project("lib", &[], &[("build", &[])]),
+        ]);
+        TaskGraph::build(&ws, &["build".into(), "lint".into(), "test".into()], None).unwrap();
+        assert_eq!(
+            UPSTREAM_LOOKUPS.take(),
+            [("app".to_string(), "build".to_string())]
+        );
     }
 
     #[test]
