@@ -183,17 +183,14 @@ impl Workspace {
                     .push(file.clone());
             }
         }
-        let js_roots: BTreeMap<String, PathBuf> = drafts
-            .iter()
-            .filter_map(|(r, d)| d.js_name.clone().map(|n| (n, r.clone())))
-            .collect();
         let ts_paths = ts::TsPaths::load(&root)?;
-        for (project, deps) in ts::import_edges(&root, &owned, &owners, &js_roots, &ts_paths) {
-            drafts
+        for (project, edges) in ts::import_edges(&root, &owned, &owners, &package_roots, &ts_paths)
+        {
+            let draft = drafts
                 .get_mut(&project)
-                .expect("edges start at project roots")
-                .deps
-                .extend(deps);
+                .expect("edges start at project roots");
+            draft.deps.extend(edges.deps);
+            draft.dev_deps.extend(edges.dev_deps);
         }
 
         let projects = drafts
@@ -744,6 +741,32 @@ command = "true"
             BTreeSet::from(["libs/money".to_string()])
         );
         assert!(ws.projects["libs/money"].deps.is_empty());
+    }
+
+    #[test]
+    fn test_file_imports_are_dev_edges_and_break_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "pnpm-workspace.yaml", "packages: ['libs/*']\n");
+        write(dir.path(), "libs/a/package.json", r#"{"name":"@acme/a"}"#);
+        write(dir.path(), "libs/b/package.json", r#"{"name":"@acme/b"}"#);
+        write(dir.path(), "libs/a/src/a.ts", "export const a = 1;\n");
+        write(
+            dir.path(),
+            "libs/a/src/a.test.ts",
+            "import { b } from '@acme/b';\n",
+        );
+        write(
+            dir.path(),
+            "libs/b/src/b.ts",
+            "import { a } from '@acme/a';\n",
+        );
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let a = &ws.projects["@acme/a"];
+        let b = &ws.projects["@acme/b"];
+        assert!(a.deps.is_empty());
+        assert_eq!(a.dev_deps, BTreeSet::from(["@acme/b".to_string()]));
+        assert_eq!(b.deps, BTreeSet::from(["@acme/a".to_string()]));
+        assert!(b.dev_deps.is_empty());
     }
 
     #[test]

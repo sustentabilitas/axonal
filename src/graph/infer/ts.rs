@@ -24,6 +24,8 @@ const ALIAS_SUFFIXES: [&str; 9] = [
     ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".d.ts",
 ];
 
+const TEST_DIRS: [&str; 5] = ["__tests__", "__mocks__", "test", "tests", "e2e"];
+
 const ROOT_CONFIGS: [&str; 2] = ["tsconfig.base.json", "tsconfig.json"];
 const MAX_EXTENDS: usize = 16;
 
@@ -295,6 +297,40 @@ fn resolve(
         .collect()
 }
 
+/// Whether a file is test code. `path` is relative to its project root, so a project
+/// living at `libs/test` isn't all tests.
+pub fn is_test_file(path: &Path) -> bool {
+    let named = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".test.") || n.contains(".spec."));
+    named
+        || path.parent().is_some_and(|dir| {
+            dir.components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .any(|c| TEST_DIRS.contains(&c))
+        })
+}
+
+/// The project roots one project imports from. A root imported by any non-test file is a
+/// dep; one imported only by test files is a dev dep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Edges {
+    pub deps: BTreeSet<PathBuf>,
+    pub dev_deps: BTreeSet<PathBuf>,
+}
+
+impl Edges {
+    fn add(&mut self, dep: PathBuf, from_test: bool) {
+        if !from_test {
+            self.dev_deps.remove(&dep);
+            self.deps.insert(dep);
+        } else if !self.deps.contains(&dep) {
+            self.dev_deps.insert(dep);
+        }
+    }
+}
+
 /// For each project root, the other project roots its TS/JS sources import from.
 /// `owned` maps project roots to their files; `packages` maps package names to roots.
 pub fn import_edges(
@@ -303,7 +339,7 @@ pub fn import_edges(
     owners: &Owners,
     packages: &BTreeMap<String, PathBuf>,
     paths: &TsPaths,
-) -> BTreeMap<PathBuf, BTreeSet<PathBuf>> {
+) -> BTreeMap<PathBuf, Edges> {
     let workspace: BTreeSet<&Path> = owned.values().flatten().map(PathBuf::as_path).collect();
     let sources: Vec<(&PathBuf, &PathBuf)> = owned
         .iter()
@@ -317,21 +353,22 @@ pub fn import_edges(
     sources
         .into_par_iter()
         .flat_map_iter(|(project, file)| {
+            let from_test = file.strip_prefix(project).is_ok_and(is_test_file);
             let bytes = std::fs::read(root.join(file)).unwrap_or_default();
             specifiers(file, &String::from_utf8_lossy(&bytes))
                 .iter()
                 .flat_map(|spec| resolve(spec, file, owners, packages, paths, &workspace))
                 .filter(|dep| dep != project)
-                .map(|dep| (project.clone(), dep))
+                .map(|dep| (project.clone(), dep, from_test))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
         .into_iter()
-        .fold(BTreeMap::new(), |mut edges, (project, dep)| {
+        .fold(BTreeMap::new(), |mut edges, (project, dep, from_test)| {
             edges
                 .entry(project)
-                .or_insert_with(BTreeSet::new)
-                .insert(dep);
+                .or_insert_with(Edges::default)
+                .add(dep, from_test);
             edges
         })
 }
@@ -619,11 +656,11 @@ const glued = () => import("a" + "b");
 
         let edges = import_edges(root, &owned, &owners, &packages, &paths);
         assert_eq!(
-            edges[Path::new("libs/billing")],
+            edges[Path::new("libs/billing")].deps,
             BTreeSet::from([PathBuf::from("libs/money")])
         );
         assert_eq!(
-            edges[Path::new("apps/shop")],
+            edges[Path::new("apps/shop")].deps,
             BTreeSet::from([PathBuf::from("libs/billing"), PathBuf::from("packages/ui")])
         );
         assert!(!edges.contains_key(Path::new("libs/money")));
@@ -653,12 +690,73 @@ const glued = () => import("a" + "b");
         let edges = import_edges(root, &owned, &owners, &BTreeMap::new(), &paths);
         assert!(!edges.contains_key(Path::new("apps/a")));
         assert_eq!(
-            edges[Path::new("apps/b")],
+            edges[Path::new("apps/b")].deps,
             BTreeSet::from([PathBuf::from("types")])
         );
         assert_eq!(
-            edges[Path::new("apps/c")],
+            edges[Path::new("apps/c")].deps,
             BTreeSet::from([PathBuf::from("types")])
+        );
+    }
+
+    #[test]
+    fn test_files_are_recognised_by_name_or_directory() {
+        for test in [
+            "src/a.test.ts",
+            "src/a.spec.tsx",
+            "src/__tests__/a.ts",
+            "src/__mocks__/fs.ts",
+            "test/a.ts",
+            "tests/unit/a.ts",
+            "e2e/login.ts",
+        ] {
+            assert!(is_test_file(Path::new(test)), "{test}");
+        }
+        for source in [
+            "src/a.ts",
+            "src/testing.ts",
+            "src/latest/a.ts",
+            "src/a.tests.ts",
+        ] {
+            assert!(!is_test_file(Path::new(source)), "{source}");
+        }
+    }
+
+    #[test]
+    fn imports_only_from_test_files_are_dev_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "libs/a/src/a.test.ts",
+            "import '@acme/b';\nimport '@acme/c';\n",
+        );
+        write(root, "libs/a/src/a.ts", "import '@acme/c';\n");
+        write(root, "libs/test/src/t.ts", "import '@acme/b';\n");
+        write(root, "libs/b/index.ts", "");
+        write(root, "libs/c/index.ts", "");
+
+        let roots = ["libs/a", "libs/b", "libs/c", "libs/test"].map(PathBuf::from);
+        let owners = Owners::new(roots);
+        let owned = owned_files(root, &owners);
+        let packages = ["b", "c"]
+            .map(|n| (format!("@acme/{n}"), PathBuf::from(format!("libs/{n}"))))
+            .into();
+
+        let edges = import_edges(root, &owned, &owners, &packages, &TsPaths::default());
+        assert_eq!(
+            edges[Path::new("libs/a")],
+            Edges {
+                deps: BTreeSet::from([PathBuf::from("libs/c")]),
+                dev_deps: BTreeSet::from([PathBuf::from("libs/b")]),
+            }
+        );
+        assert_eq!(
+            edges[Path::new("libs/test")],
+            Edges {
+                deps: BTreeSet::from([PathBuf::from("libs/b")]),
+                dev_deps: BTreeSet::new(),
+            }
         );
     }
 }
