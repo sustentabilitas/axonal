@@ -1139,7 +1139,7 @@ impl<'a> Plan<'a> {
 
     /// Lockfiles, workspace manifests, toolchain files and tool configs for the project's
     /// kinds (all of them for explicit projects, which may run anything), `[workspace]
-    /// inputs`, and the project's own manifests. No
+    /// inputs`, and the project's own manifests and root `tsconfig*.json` files. No
     /// `inputs` list can drop these; missing ones hash as `missing`.
     fn implicit(&mut self, project: &'a Project) -> Result<Rc<[PathBuf]>> {
         let workspace = self.workspace_inputs()?;
@@ -1158,9 +1158,19 @@ impl<'a> Plan<'a> {
                         kinds.contains(kind) || project.files.binary_search(path).is_ok()
                     })
                     .map(|(_, path)| path);
+                let tsconfigs = project.files.iter().filter(|file| {
+                    file.parent() == Some(project.root.as_path())
+                        && file
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("tsconfig") && name.ends_with(".json")
+                            })
+                });
                 ecosystems
                     .chain(workspace.every.iter().cloned())
                     .chain(manifests)
+                    .chain(tsconfigs.cloned())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect()
@@ -2415,6 +2425,52 @@ inputs = ["src/**"]
             key_of(dir.path(), "build", "c"),
             c,
             "JS configs aren't Cargo inputs"
+        );
+    }
+
+    #[test]
+    fn project_tsconfigs_change_keys_whatever_the_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+        write(
+            root,
+            "packages/p/package.json",
+            r#"{"name":"p","scripts":{"typecheck":"tsc"}}"#,
+        );
+        write(root, "packages/p/src/index.ts", "");
+        write(
+            root,
+            "packages/p/tsconfig.json",
+            r#"{"compilerOptions":{}}"#,
+        );
+        write(root, "packages/p/tsconfig.build.json", "{}");
+        write(root, "packages/p/docs/tsconfig.json", "{}");
+        write(
+            root,
+            "axonal.toml",
+            "[projects.\"packages/p\".targets.typecheck]\ninputs = [\"src/**\"]\n",
+        );
+        let k0 = key_of(root, "typecheck", "p");
+        write(
+            root,
+            "packages/p/tsconfig.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        );
+        let k1 = key_of(root, "typecheck", "p");
+        assert_ne!(k0, k1);
+        write(
+            root,
+            "packages/p/tsconfig.build.json",
+            r#"{"extends":"./tsconfig.json"}"#,
+        );
+        let k2 = key_of(root, "typecheck", "p");
+        assert_ne!(k1, k2);
+        write(root, "packages/p/docs/tsconfig.json", r#"{"x":1}"#);
+        assert_eq!(
+            key_of(root, "typecheck", "p"),
+            k2,
+            "only the project root's"
         );
     }
 
