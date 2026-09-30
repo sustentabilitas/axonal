@@ -2,3 +2,4 @@
 
 pub mod cargo;
 pub mod pnpm;
+pub mod ts;
