@@ -44,16 +44,50 @@ struct Guard<'a> {
     _write: Option<RwLockWriteGuard<'a, ()>>,
 }
 
-/// One in-process lock per cache directory, shared by every `Local` for it.
+/// One in-process lock per cache directory, shared by every `Local` for it however its
+/// path is spelled.
 fn thread_lock(dir: &Path) -> Arc<RwLock<()>> {
     static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<RwLock<()>>>>> =
         LazyLock::new(Default::default);
     LOCKS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .entry(dir.to_path_buf())
+        .entry(canonical(dir))
         .or_default()
         .clone()
+}
+
+/// `path` with its deepest existing ancestor canonicalized, so it is the same before and
+/// after the rest is created.
+fn canonical(path: &Path) -> PathBuf {
+    path.ancestors()
+        .find_map(|a| Some((a, a.canonicalize().ok()?)))
+        .and_then(|(a, c)| Some(c.join(path.strip_prefix(a).ok()?)))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// The process that made a scratch entry (`<pid>-<seq>…`) or temp file
+/// (`.<name>.<pid>-<seq>.tmp`).
+fn owner(name: &str) -> Option<u32> {
+    let tail = name
+        .strip_suffix(TMP)
+        .map_or(name, |stem| stem.rsplit('.').next().unwrap_or(stem));
+    tail.split('-').next()?.parse().ok()
+}
+
+#[cfg(unix)]
+fn is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it only checks that the process exists.
+    let found = unsafe { libc::kill(pid, 0) } == 0;
+    found || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn is_alive(_: u32) -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,14 +211,16 @@ impl Local {
     }
 
     /// Under the exclusive lock, deletes what interrupted work left behind: temp files and
-    /// scratch entries older than [`STALE_TMP`] (younger ones may still be being written),
-    /// and archives without metadata (entries are only swapped in under this lock).
+    /// scratch entries older than [`STALE_TMP`] whose process is gone (others may still be
+    /// in use), and archives without metadata (entries are only swapped in under this
+    /// lock).
     fn sweep(&self) -> io::Result<()> {
         let cutoff = SystemTime::now() - STALE_TMP;
-        let stale = |path: &Path| {
-            fs::symlink_metadata(path)
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t < cutoff)
+        let abandoned = |dir: &Path, name: &str| {
+            !owner(name).is_some_and(is_alive)
+                && fs::symlink_metadata(dir.join(name))
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t < cutoff)
         };
         let orphan = |name: &str| {
             name.strip_suffix(ARCHIVE)
@@ -192,15 +228,15 @@ impl Local {
         };
         self.names()?
             .into_iter()
-            .filter(|name| (name.ends_with(TMP) && stale(&self.dir.join(name))) || orphan(name))
+            .filter(|name| (name.ends_with(TMP) && abandoned(&self.dir, name)) || orphan(name))
             .try_for_each(|name| remove_path(&self.dir.join(name)))?;
         existing(fs::read_dir(&self.scratch))?
             .into_iter()
             .flatten()
             .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|path| stale(path))
-            .try_for_each(|path| remove_path(&path))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| abandoned(&self.scratch, name))
+            .try_for_each(|name| remove_path(&self.scratch.join(name)))
     }
 
     /// Removes an entry found bad, unless a put has replaced its metadata since.
@@ -658,28 +694,75 @@ mod tests {
         let store = Local::new(dir.path());
         put(&store, &Key("k1".into()), "x");
         let scratch = dir.path().join(TMP_DIR);
-        fs::create_dir_all(scratch.join("1-0/new")).unwrap();
+        fs::create_dir_all(scratch.join("2147483647-0/new")).unwrap();
         for path in [
-            store.dir().join(".k2.json.1-0.tmp"),
-            store.dir().join(".k3.json.1-1.tmp"),
-            scratch.join("1-1.tar.zst"),
-            scratch.join("1-2.tar.zst"),
+            store.dir().join(".k2.json.2147483647-0.tmp"),
+            store.dir().join(".k3.json.2147483647-1.tmp"),
+            scratch.join("2147483647-1.tar.zst"),
+            scratch.join("2147483647-2.tar.zst"),
         ] {
             fs::write(path, "partial").unwrap();
         }
-        age(&store.dir().join(".k3.json.1-1.tmp"), 2 * 3600);
-        age(&scratch.join("1-2.tar.zst"), 2 * 3600);
-        age(&scratch.join("1-0"), 2 * 3600);
+        age(&store.dir().join(".k3.json.2147483647-1.tmp"), 2 * 3600);
+        age(&scratch.join("2147483647-2.tar.zst"), 2 * 3600);
+        age(&scratch.join("2147483647-0"), 2 * 3600);
         store.evict(u64::MAX).unwrap();
         assert_eq!(
             names(&store),
-            [".k2.json.1-0.tmp", ".lock", "k1.json", "k1.tar.zst"]
+            [
+                ".k2.json.2147483647-0.tmp",
+                ".lock",
+                "k1.json",
+                "k1.tar.zst"
+            ]
         );
         let left = fs::read_dir(&scratch)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(left, ["1-1.tar.zst"]);
+        assert_eq!(left, ["2147483647-1.tar.zst"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_spares_old_scratch_entries_of_live_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Local::new(dir.path());
+        put(&store, &Key("k1".into()), "x");
+        let live = format!("{}-99", std::process::id());
+        let parked = dir.path().join(TMP_DIR).join(&live).join("old/dist/a.js");
+        fs::create_dir_all(parked.parent().unwrap()).unwrap();
+        fs::write(&parked, "parked").unwrap();
+        let temp = store.dir().join(format!(".k2.json.{live}.tmp"));
+        fs::write(&temp, "partial").unwrap();
+        age(&dir.path().join(TMP_DIR).join(&live), 2 * 3600);
+        age(&temp, 2 * 3600);
+        store.evict(u64::MAX).unwrap();
+        assert!(parked.exists());
+        assert!(temp.exists());
+    }
+
+    #[test]
+    fn differently_spelled_roots_share_the_in_process_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let spellings = [
+            dir.path().to_path_buf(),
+            dir.path().join("."),
+            dir.path().canonicalize().unwrap(),
+        ];
+        let before = spellings.each_ref().map(|root| Local::new(root));
+        assert!(
+            before
+                .iter()
+                .all(|l| Arc::ptr_eq(&l.threads, &before[0].threads))
+        );
+        put(&before[1], &Key("k1".into()), "x");
+        let after = spellings.each_ref().map(|root| Local::new(root));
+        assert!(
+            after
+                .iter()
+                .all(|l| Arc::ptr_eq(&l.threads, &before[0].threads))
+        );
     }
 
     #[test]
