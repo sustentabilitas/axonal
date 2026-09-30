@@ -762,6 +762,6 @@ mod tests {
         let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
         let dst = tempfile::tempdir().unwrap();
         restore(dst.path(), &meta, File::open(packed.path()).unwrap(), &[]).unwrap();
-        assert_eq!(snapshot(dst.path()).len(), 200);
+        assert_eq!(crate::files::list(dst.path()).unwrap().len(), 200);
     }
 }
