@@ -51,19 +51,22 @@ impl TaskGraph {
         targets: &[String],
         projects: Option<&BTreeSet<String>>,
     ) -> Result<TaskGraph> {
-        if let Some(missing) = targets
-            .iter()
-            .find(|t| !ws.projects.values().any(|p| p.targets.contains_key(*t)))
-        {
-            return Err(Error::UnknownTarget(missing.clone()));
-        }
         if let Some(names) = projects {
             ws.check_projects(names)?;
         }
-        let roots = ws
+        let selected: Vec<&Project> = ws
             .projects
             .values()
             .filter(|p| projects.is_none_or(|names| names.contains(&p.name)))
+            .collect();
+        if let Some(missing) = targets
+            .iter()
+            .find(|t| !selected.iter().any(|p| p.targets.contains_key(*t)))
+        {
+            return Err(Error::UnknownTarget(missing.clone()));
+        }
+        let roots = selected
+            .iter()
             .flat_map(|p| {
                 targets
                     .iter()
@@ -299,6 +302,18 @@ mod tests {
         assert!(matches!(
             TaskGraph::build(&chain(), &["build".into()], Some(&BTreeSet::from(["ghost".into()]))),
             Err(Error::UnknownProject(p)) if p == "ghost"
+        ));
+    }
+
+    #[test]
+    fn a_target_no_selected_project_has_is_unknown() {
+        let ws = workspace(vec![
+            project("app", &[], &[("build", &[])]),
+            project("web", &[], &[("deploy", &[])]),
+        ]);
+        assert!(matches!(
+            TaskGraph::build(&ws, &["deploy".into()], Some(&BTreeSet::from(["app".into()]))),
+            Err(Error::UnknownTarget(t)) if t == "deploy"
         ));
     }
 

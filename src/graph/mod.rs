@@ -231,6 +231,7 @@ impl Workspace {
                 Ok::<_, Error>((name, project))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        check_depends_on(&projects)?;
 
         Ok(Workspace {
             root,
@@ -406,6 +407,34 @@ fn resolve_targets(
             Target::finalize(project, name, merged).map(|t| (name.clone(), t))
         })
         .collect()
+}
+
+/// Every `depends_on` entry, with or without `^`, must name a target some project defines.
+fn check_depends_on(projects: &BTreeMap<String, Project>) -> Result<()> {
+    let defined: BTreeSet<&str> = projects
+        .values()
+        .flat_map(|p| p.targets.keys().map(String::as_str))
+        .collect();
+    projects
+        .values()
+        .flat_map(|p| {
+            p.targets.iter().flat_map(move |(name, target)| {
+                target.depends_on.iter().map(move |dep| (p, name, dep))
+            })
+        })
+        .find(|(_, _, dep)| {
+            let target = dep.strip_prefix('^').unwrap_or(dep);
+            target.is_empty() || !defined.contains(target)
+        })
+        .map_or(Ok(()), |(p, name, dep)| {
+            Err(Error::Config {
+                path: PathBuf::from(config::FILE),
+                message: format!(
+                    "target `{name}` of project `{}` depends on `{dep}`, which no project defines",
+                    p.name
+                ),
+            })
+        })
 }
 
 /// A quoted DOT ID: only `\` and `"` need escaping.
@@ -759,6 +788,36 @@ command = "true"
             Workspace::discover(dir.path()),
             Err(Error::MissingCommand { .. })
         ));
+    }
+
+    #[test]
+    fn depends_on_entries_must_name_a_defined_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |entries: &str| {
+            format!(
+                "[projects.\"libs/a\".targets.build]\ncommand = \"make\"\n\n\
+                 [projects.\"libs/a\".targets.test]\ncommand = \"make test\"\ndepends_on = [{entries}]\n\n\
+                 [projects.\"libs/b\".targets.lint]\ncommand = \"eslint .\"\n"
+            )
+        };
+        for entry in ["biuld", "^biuld", "^", ""] {
+            write(dir.path(), "axonal.toml", &config(&format!("\"{entry}\"")));
+            match Workspace::discover(dir.path()) {
+                Err(Error::Config { message, .. }) => {
+                    assert!(message.contains("`libs/a`"), "{message}");
+                    assert!(message.contains("`test`"), "{message}");
+                    assert!(message.contains(&format!("`{entry}`")), "{message}");
+                }
+                other => panic!("expected a config error for {entry:?}, got {other:?}"),
+            }
+        }
+
+        write(
+            dir.path(),
+            "axonal.toml",
+            &config(r#""build", "^build", "^lint""#),
+        );
+        assert!(Workspace::discover(dir.path()).is_ok());
     }
 
     #[test]
