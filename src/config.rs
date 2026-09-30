@@ -149,7 +149,10 @@ impl Config {
         match std::fs::read_to_string(&path) {
             Ok(text) => Self::parse(&text, &path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(Error::Config {
+                path,
+                message: e.to_string(),
+            }),
         }
     }
 
@@ -217,6 +220,15 @@ mode = "shadow"
     }
 
     #[test]
+    fn unreadable_files_name_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(FILE)).unwrap();
+        let err = Config::load(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("axonal.toml"), "{err}");
+    }
+
+    #[test]
     fn unknown_fields_report_file_and_line() {
         let err = Config::parse(
             "[workspace]\ndefault_branch = \"main\"\nbogus = 1\n",
@@ -246,6 +258,19 @@ mode = "shadow"
     }
 
     #[test]
+    fn target_or_keeps_an_explicit_empty_list() {
+        let own = TargetConfig {
+            depends_on: Some(vec![]),
+            ..TargetConfig::default()
+        };
+        let fallback = TargetConfig {
+            depends_on: Some(vec!["^build".into()]),
+            ..TargetConfig::default()
+        };
+        assert_eq!(own.or(&fallback).depends_on, Some(vec![]));
+    }
+
+    #[test]
     fn deps_usage_defaults_by_target_name() {
         assert_eq!(DepsUsage::default_for("fmt"), DepsUsage::None);
         assert_eq!(DepsUsage::default_for("lint"), DepsUsage::Api);
@@ -260,5 +285,8 @@ mode = "shadow"
         assert_eq!(parse_size("1024"), Some(1024));
         assert_eq!(parse_size("x"), None);
         assert_eq!(parse_size("10PB"), None);
+        assert_eq!(parse_size("18446744073709551616"), None);
+        assert_eq!(parse_size("99999999TB"), None);
+        assert_eq!(parse_size("1.5GB"), None);
     }
 }
