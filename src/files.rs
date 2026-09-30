@@ -165,41 +165,94 @@ impl Patterns {
         literals(&self.workspace_globs)
     }
 
-    /// Existing files matching these globs, found by walking each glob's literal base
-    /// directory without gitignore filtering (outputs are usually ignored).
+    /// Existing non-directories matching these globs, found by walking each glob's literal
+    /// base without gitignore filtering (outputs are usually ignored) and skipping `.git`,
+    /// `.axonal` and `node_modules` below it. Symlinks are reported, never followed: a
+    /// matching link is a leaf, and a symlink on the glob base's own path is reported
+    /// whether or not it matches, since everything the glob could match lies behind it.
     /// Workspace-relative and sorted.
     pub fn existing_files(&self, root: &Path, project_root: &Path) -> Result<Vec<PathBuf>> {
-        let project_dir = root.join(project_root);
-        let mut found = BTreeSet::new();
-        for (globs, set, base) in [
-            (&self.project_globs, &self.project, project_dir.as_path()),
-            (&self.workspace_globs, &self.workspace, root),
-        ] {
-            for glob in globs {
-                let start = base.join(glob_base(glob));
-                if !start.exists() {
-                    continue;
+        [
+            (&self.project_globs, &self.project, project_root),
+            (&self.workspace_globs, &self.workspace, Path::new("")),
+        ]
+        .into_iter()
+        .flat_map(|(globs, set, base)| globs.iter().map(move |glob| (glob, set, base)))
+        .try_fold(BTreeSet::new(), |mut found, (glob, set, base)| {
+            let walk = Walk { root, base, set };
+            walk.start(&glob_base(glob), &mut found)?;
+            Ok::<_, Error>(found)
+        })
+        .map(|found| found.into_iter().collect())
+    }
+}
+
+/// A symlink-free walk collecting workspace-relative paths that match `set` relative to
+/// `base` (itself workspace-relative).
+struct Walk<'a> {
+    root: &'a Path,
+    base: &'a Path,
+    set: &'a GlobSet,
+}
+
+impl Walk<'_> {
+    /// Descends `glob_base` one component at a time, stopping at the first missing path or
+    /// symlink.
+    fn start(&self, glob_base: &Path, found: &mut BTreeSet<PathBuf>) -> Result<()> {
+        let mut rel = self.base.to_path_buf();
+        let mut parts = glob_base.components().peekable();
+        while let Some(part) = parts.next() {
+            rel.push(part);
+            let Some(meta) = symlink_metadata(&self.root.join(&rel))? else {
+                return Ok(());
+            };
+            if meta.is_symlink() {
+                found.insert(rel);
+                return Ok(());
+            }
+            if !meta.is_dir() {
+                if parts.peek().is_none() {
+                    self.leaf(rel, found);
                 }
-                let walker = WalkBuilder::new(&start)
-                    .standard_filters(false)
-                    .filter_entry(|e| {
-                        e.depth() == 0
-                            || !(e.file_type().is_some_and(|t| t.is_dir()) && is_skipped(e))
-                    })
-                    .build();
-                for entry in walker {
-                    let entry = entry.map_err(|e| Error::Io(std::io::Error::other(e)))?;
-                    if !entry.file_type().is_some_and(|t| t.is_file()) {
-                        continue;
-                    }
-                    let path = entry.path();
-                    if path.strip_prefix(base).is_ok_and(|rel| set.is_match(rel)) {
-                        found.insert(path.strip_prefix(root).expect("under root").to_path_buf());
-                    }
-                }
+                return Ok(());
             }
         }
-        Ok(found.into_iter().collect())
+        match symlink_metadata(&self.root.join(&rel))? {
+            Some(meta) if meta.is_dir() => self.dir(&rel, found),
+            _ => Ok(()),
+        }
+    }
+
+    fn dir(&self, rel: &Path, found: &mut BTreeSet<PathBuf>) -> Result<()> {
+        std::fs::read_dir(self.root.join(rel))?.try_for_each(|entry| {
+            let entry = entry?;
+            let path = rel.join(entry.file_name());
+            if !entry.file_type()?.is_dir() {
+                self.leaf(path, found);
+                Ok(())
+            } else if SKIPPED_DIRS.iter().any(|d| entry.file_name() == *d) {
+                Ok(())
+            } else {
+                self.dir(&path, found)
+            }
+        })
+    }
+
+    fn leaf(&self, rel: PathBuf, found: &mut BTreeSet<PathBuf>) {
+        if rel
+            .strip_prefix(self.base)
+            .is_ok_and(|r| self.set.is_match(r))
+        {
+            found.insert(rel);
+        }
+    }
+}
+
+fn symlink_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -405,6 +458,50 @@ mod tests {
             cache.existing_files(dir.path(), root).unwrap(),
             paths(&["libs/a/node_modules/.cache/c.js"])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_files_report_symlink_leaves_without_following_them() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "libs/a/dist/a.js");
+        touch(dir.path(), "elsewhere/creds/secret");
+        symlink(
+            dir.path().join("elsewhere/creds"),
+            dir.path().join("libs/a/dist/config"),
+        )
+        .unwrap();
+        symlink("a.js", dir.path().join("libs/a/dist/b.js")).unwrap();
+        symlink("nowhere", dir.path().join("libs/a/dist/dangling")).unwrap();
+        let p = Patterns::new(&["dist/**".into()]).unwrap();
+        assert_eq!(
+            p.existing_files(dir.path(), Path::new("libs/a")).unwrap(),
+            paths(&[
+                "libs/a/dist/a.js",
+                "libs/a/dist/b.js",
+                "libs/a/dist/config",
+                "libs/a/dist/dangling"
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_files_never_follow_a_symlinked_glob_base() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "elsewhere/out/x.js");
+        fs::create_dir_all(dir.path().join("libs/a")).unwrap();
+        symlink(dir.path().join("elsewhere"), dir.path().join("libs/a/dist")).unwrap();
+        for glob in ["dist/**", "dist/out/**/*.js"] {
+            let p = Patterns::new(&[glob.into()]).unwrap();
+            assert_eq!(
+                p.existing_files(dir.path(), Path::new("libs/a")).unwrap(),
+                paths(&["libs/a/dist"]),
+                "{glob}"
+            );
+        }
     }
 
     #[test]
