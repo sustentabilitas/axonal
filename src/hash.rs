@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, Metadata},
     hash::Hash,
@@ -539,7 +539,8 @@ impl Toolchain {
     /// Node and pnpm for JS workspaces, rustc for Cargo ones, run in parallel from the
     /// workspace root (so `rust-toolchain.toml`, corepack and version managers apply). A
     /// tool that is missing or fails hashes as `missing`; one still running after
-    /// five seconds is killed and hashes as `timeout`.
+    /// five seconds, or whose output doesn't arrive by then, is killed and hashes as its
+    /// binary's identity (see [`binary_identity`]).
     pub fn detect(ws: &Workspace) -> Toolchain {
         let uses = |kind: Kind, manifest: &str| {
             ws.root.join(manifest).is_file()
@@ -615,9 +616,13 @@ fn run_probes(dir: &Path, probes: &[Probe], timeout: Duration) -> BTreeMap<&'sta
     })
 }
 
+/// How long stdout may still take once the probe has exited, however close the deadline.
+const READ_GRACE: Duration = Duration::from_millis(100);
+
 /// Runs `p` in its own process group, killing the whole group at the deadline. Stdout is
 /// read on a detached thread, since a grandchild can hold the pipe open after the child
-/// exits.
+/// exits. A probe that times out, or whose output doesn't arrive, hashes as its binary's
+/// identity.
 fn probe(dir: &Path, p: &Probe, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut command = Command::new(p.program);
@@ -630,8 +635,9 @@ fn probe(dir: &Path, p: &Probe, timeout: Duration) -> String {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let Ok(mut child) = command.spawn() else {
-        return "missing".into();
+        return MISSING.into();
     };
+    let identity = || binary_identity(dir, p.program, std::env::var_os("PATH").as_deref());
     let stdout = child.stdout.take().map(|mut out| {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -640,31 +646,62 @@ fn probe(dir: &Path, p: &Probe, timeout: Duration) -> String {
         });
         rx
     });
-    let status = loop {
-        match child.try_wait() {
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(PROBE_POLL),
-            Ok(None) => {
+    loop {
+        match exited(&mut child) {
+            Ok(false) if Instant::now() < deadline => std::thread::sleep(PROBE_POLL),
+            Ok(false) => {
                 kill(&mut child);
-                return "timeout".into();
+                return identity();
             }
-            Ok(Some(status)) => break status,
+            Ok(true) => break,
             Err(_) => {
                 kill(&mut child);
-                return "missing".into();
+                return MISSING.into();
             }
         }
-    };
-    match stdout.map(|rx| rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))) {
-        Some(Ok(Ok(text))) if status.success() => text.trim().to_string(),
-        Some(Err(mpsc::RecvTimeoutError::Timeout)) => {
-            kill_group(&child);
-            "timeout".into()
-        }
-        _ => "missing".into(),
+    }
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(READ_GRACE);
+    let output = stdout.map(|rx| rx.recv_timeout(wait));
+    let unfinished = matches!(output, Some(Err(mpsc::RecvTimeoutError::Timeout)));
+    if unfinished {
+        kill_group(&child);
+    }
+    match (output, child.wait()) {
+        _ if unfinished => identity(),
+        (Some(Ok(Ok(text))), Ok(status)) if status.success() => text.trim().to_string(),
+        _ => MISSING.into(),
     }
 }
 
-/// Kills the probe and everything it spawned, then reaps it.
+/// Whether the child has exited, without reaping it, so its pid, which is also its
+/// process group id, stays reserved until [`Child::wait`].
+#[cfg(unix)]
+fn exited(child: &mut Child) -> io::Result<bool> {
+    // SAFETY: `siginfo_t` is plain data, for which all zeroes is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    // SAFETY: `info` is a valid, writable `siginfo_t`; WNOWAIT leaves the child waitable.
+    match unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, options) } {
+        0 => {
+            // SAFETY: waitid succeeded, so `info` is initialised; with WNOHANG `si_pid`
+            // stays 0 while the child runs.
+            Ok(unsafe { info.si_pid() } != 0)
+        }
+        _ => match io::Error::last_os_error() {
+            e if e.kind() == io::ErrorKind::Interrupted => Ok(false),
+            e => Err(e),
+        },
+    }
+}
+
+#[cfg(not(unix))]
+fn exited(child: &mut Child) -> io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+/// Kills the probe and everything still in its group, then reaps it.
 fn kill(child: &mut Child) {
     kill_group(child);
     // A failed kill means the child already exited; `wait` reaps it either way.
@@ -672,18 +709,66 @@ fn kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// The group id is the probe's pid, which isn't reused while any group member lives, even
-/// after the probe itself is reaped.
+/// Signals the probe's process group, whose id is the probe's pid. The probe is never
+/// reaped before this runs (see [`exited`]), so running or a zombie, it keeps that pid
+/// reserved and no other group can have taken it.
 #[cfg(unix)]
 fn kill_group(child: &Child) {
     if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: `killpg` only sends a signal; ESRCH for an empty group is harmless.
+        // SAFETY: `killpg` only sends a signal, to a group id the unreaped probe still
+        // reserves; ESRCH, when no live member is left, is harmless.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
     }
 }
 
 #[cfg(not(unix))]
 fn kill_group(_: &Child) {}
+
+/// What a tool that can't report its version hashes as: `timeout:` plus the canonical
+/// path, size and mtime of the binary `program` resolves to, or `missing` if there's none.
+fn binary_identity(dir: &Path, program: &str, search: Option<&OsStr>) -> String {
+    find_program(dir, program, search)
+        .and_then(|bin| fs::canonicalize(bin).ok())
+        .and_then(|bin| fs::metadata(&bin).ok().map(|meta| (bin, Stat::of(&meta))))
+        .map_or_else(
+            || MISSING.into(),
+            |(bin, stat)| {
+                let mut fields = Fields::new();
+                fields
+                    .add("binary", path_bytes(&bin))
+                    .add("size", stat.size.to_le_bytes())
+                    .add("mtime_ns", stat.mtime_ns.to_le_bytes());
+                format!("timeout:{}", fields.finish())
+            },
+        )
+}
+
+/// Where `program` resolves: itself if it names a path, else the first executable match
+/// in `search`, a `PATH` value. Both are taken relative to `dir`, where probes run.
+fn find_program(dir: &Path, program: &str, search: Option<&OsStr>) -> Option<PathBuf> {
+    let program = Path::new(program);
+    if program.components().count() > 1 {
+        return Some(dir.join(program)).filter(|path| is_executable(path));
+    }
+    search
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|entry| dir.join(entry).join(program))
+        .find(|path| is_executable(path))
+}
+
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| {
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = true;
+        meta.is_file() && executable
+    })
+}
 
 /// Looks up an environment variable; production callers pass `std::env::var_os`.
 pub type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
@@ -2435,8 +2520,80 @@ inputs = ["src/**"]
             "{:?}",
             start.elapsed()
         );
-        assert_eq!(versions["slow"], "timeout");
-        assert_eq!(versions["also_slow"], "timeout");
+        assert_eq!(versions["slow"], identity_of("sleep"));
+        assert_eq!(versions["also_slow"], identity_of("sleep"));
+    }
+
+    /// What a probe of `program` that times out hashes as.
+    #[cfg(unix)]
+    fn identity_of(program: &str) -> String {
+        let identity =
+            binary_identity(Path::new("/"), program, std::env::var_os("PATH").as_deref());
+        assert!(identity.starts_with("timeout:"), "{program}: {identity}");
+        identity
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_tools_are_identified_by_their_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let bins = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let tool = |dir: &tempfile::TempDir, body: &str| {
+            let path = dir.path().join("tool");
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            &*String::leak(path.to_str().unwrap().to_string())
+        };
+        let (v1, v2) = (
+            tool(&bins[0], "#!/bin/sh\nsleep 5\n"),
+            tool(&bins[1], "#!/bin/sh\n# v2\nsleep 5\n"),
+        );
+        let probes = [("one", v1), ("two", v2), ("one_again", v1)].map(|(name, program)| Probe {
+            name,
+            program,
+            args: &[],
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let versions = run_probes(dir.path(), &probes, Duration::from_millis(300));
+        assert!(versions["one"].starts_with("timeout:"), "{versions:?}");
+        assert_ne!(versions["one"], versions["two"]);
+        assert_eq!(versions["one"], versions["one_again"]);
+        let toolchain = |version: &str| Toolchain {
+            versions: BTreeMap::from([("node", version.to_string())]),
+        };
+        let js = BTreeSet::from([Kind::Js]);
+        assert_ne!(
+            toolchain(&versions["one"]).relevant(&js),
+            toolchain(&versions["two"]).relevant(&js)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn programs_resolve_to_the_first_executable_on_the_search_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a/tool", "not executable");
+        write(dir.path(), "b/tool", "#!/bin/sh\n");
+        write(dir.path(), "c/tool", "#!/bin/sh\n");
+        ["b/tool", "c/tool"].iter().for_each(|tool| {
+            fs::set_permissions(dir.path().join(tool), fs::Permissions::from_mode(0o755)).unwrap();
+        });
+        let search =
+            std::env::join_paths([dir.path().join("a"), "b".into(), dir.path().join("c")]).unwrap();
+        assert_eq!(
+            find_program(dir.path(), "tool", Some(&search)),
+            Some(dir.path().join("b/tool"))
+        );
+        assert_eq!(
+            find_program(dir.path(), "./c/tool", None),
+            Some(dir.path().join("./c/tool"))
+        );
+        assert_eq!(find_program(dir.path(), "nope", Some(&search)), None);
+        assert_eq!(
+            binary_identity(dir.path(), "nope", Some(&search)),
+            "missing"
+        );
     }
 
     #[cfg(unix)]
@@ -2455,7 +2612,44 @@ inputs = ["src/**"]
             "{:?}",
             start.elapsed()
         );
-        assert_eq!(versions["forks"], "timeout");
+        assert_eq!(versions["forks"], identity_of("sh"));
+    }
+
+    /// The grandchild leaves the probe's process group, so after the probe exits it
+    /// still holds stdout and the group kill can't reach it. The probe stays unreaped
+    /// until after the kill, so the kill can only hit the probe's own group; whether a
+    /// reaped pid would have been reused can't be observed reliably, so only the outcome
+    /// is checked.
+    #[cfg(unix)]
+    #[test]
+    fn grandchildren_escaping_the_group_cannot_outlast_the_deadline() {
+        if Command::new("perl")
+            .args(["-MPOSIX", "-e", "1"])
+            .status()
+            .is_err()
+        {
+            eprintln!("perl not found; skipped");
+            return;
+        }
+        let probes = [Probe {
+            name: "escapes",
+            program: "perl",
+            args: &[
+                "-MPOSIX",
+                "-e",
+                "if (fork() == 0) { POSIX::setsid(); open(my $f, '>', 'escaped.pid'); \
+                 print $f $$; close $f; sleep 4; exit 0 } print \"1.0\\n\";",
+            ],
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let versions = run_probes(dir.path(), &probes, Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        if let Ok(pid) = fs::read_to_string(dir.path().join("escaped.pid")) {
+            let _ = Command::new("kill").arg(pid.trim()).status();
+        }
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        assert_eq!(versions["escapes"], identity_of("perl"));
     }
 
     /// `cargo test --release hash::tests::scale -- --ignored --nocapture`; set
