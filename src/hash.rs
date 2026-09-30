@@ -5,16 +5,18 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fmt,
+    fs::{self, Metadata},
+    io,
     path::{Path, PathBuf},
     process::Command,
-    time::UNIX_EPOCH,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     config::DepsUsage,
-    error::Result,
+    error::{Error, Result},
     files::{Patterns, display_root},
     graph::{Kind, Project, Target, TaskGraph, TaskId, Workspace},
 };
@@ -31,74 +33,229 @@ impl fmt::Display for Key {
     }
 }
 
-/// Content hashes keyed by path, reused while a file's size and mtime are unchanged.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// Bumped whenever [`Stamp`] or the digest format changes; other versions load empty.
+const FILE_HASHES_VERSION: u32 = 2;
+/// Files modified this recently may change again within the timestamp granularity, so
+/// their stamps are never stored (git's "racy clean" rule).
+const RACY_WINDOW: Duration = Duration::from_secs(2);
+/// The digest of a path that doesn't exist.
+const MISSING: &str = "missing";
+
+/// Content hashes keyed by UTF-8 path, reused across runs while a file's [`Stat`] is
+/// unchanged. Symlinks and non-UTF-8 paths are always hashed afresh.
+#[derive(Debug, Default)]
 pub struct FileHashCache {
-    entries: BTreeMap<PathBuf, Stamp>,
-    #[serde(skip)]
+    entries: BTreeMap<String, Stamp>,
+    /// Paths hashed this run; `save` drops every other entry.
+    seen: BTreeSet<String>,
     dirty: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Stamp {
+#[derive(Serialize, Deserialize)]
+struct OnDisk<E> {
+    version: u32,
+    entries: E,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Stat {
     size: u64,
     mtime_ns: u64,
+    ctime_s: i64,
+    ctime_ns: i64,
+    ino: u64,
+    dev: u64,
+}
+
+impl Stat {
+    fn of(meta: &Metadata) -> Stat {
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        #[cfg(unix)]
+        let (ctime_s, ctime_ns, ino, dev) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.ctime(), meta.ctime_nsec(), meta.ino(), meta.dev())
+        };
+        #[cfg(not(unix))]
+        let (ctime_s, ctime_ns, ino, dev) = (0, 0, 0, 0);
+        Stat {
+            size: meta.len(),
+            mtime_ns,
+            ctime_s,
+            ctime_ns,
+            ino,
+            dev,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Stamp {
+    #[serde(flatten)]
+    stat: Stat,
     hash: String,
 }
 
+/// One path's digest, plus the stamp to keep for it (`None`: keep nothing).
+struct Hashed {
+    digest: String,
+    stamp: Option<Stamp>,
+}
+
 impl FileHashCache {
-    /// A missing or unreadable cache file is an empty cache.
+    /// A missing, unreadable or other-version cache file is an empty cache.
     pub fn load(root: &Path) -> Self {
-        std::fs::read(root.join(FILE_HASHES))
+        fs::read(root.join(FILE_HASHES))
             .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|bytes| {
+                serde_json::from_slice::<OnDisk<BTreeMap<String, Stamp>>>(&bytes).ok()
+            })
+            .filter(|disk| disk.version == FILE_HASHES_VERSION)
+            .map(|disk| FileHashCache {
+                entries: disk.entries,
+                ..FileHashCache::default()
+            })
             .unwrap_or_default()
     }
 
+    /// Writes the entries hashed since `load`, if anything changed.
     pub fn save(&self, root: &Path) -> Result<()> {
-        if !self.dirty {
+        let kept: BTreeMap<&String, &Stamp> = self
+            .entries
+            .iter()
+            .filter(|(path, _)| self.seen.contains(*path))
+            .collect();
+        if !self.dirty && kept.len() == self.entries.len() {
             return Ok(());
         }
+        let bytes = serde_json::to_vec(&OnDisk {
+            version: FILE_HASHES_VERSION,
+            entries: kept,
+        })
+        .map_err(io::Error::other)?;
         let path = root.join(FILE_HASHES);
-        std::fs::create_dir_all(path.parent().expect("cache file has a parent"))?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        std::fs::write(
-            &tmp,
-            serde_json::to_vec(self).expect("file hashes serialize"),
-        )?;
-        std::fs::rename(tmp, path)?;
+        fs::write(&tmp, bytes)?;
+        fs::rename(tmp, path)?;
         Ok(())
     }
 
-    /// `rel` is workspace-relative.
+    /// The digest of `rel` (workspace-relative): its content and executable bit, a
+    /// symlink's text and target, or `missing`.
     pub fn hash(&mut self, root: &Path, rel: &Path) -> Result<String> {
-        let meta = std::fs::metadata(root.join(rel))?;
-        let size = meta.len();
-        let mtime_ns = meta
-            .modified()?
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-        if let Some(stamp) = self
-            .entries
-            .get(rel)
-            .filter(|s| s.size == size && s.mtime_ns == mtime_ns)
-        {
-            return Ok(stamp.hash.clone());
-        }
-        let hash = blake3::hash(&std::fs::read(root.join(rel))?)
-            .to_hex()
-            .to_string();
-        self.entries.insert(
-            rel.to_path_buf(),
-            Stamp {
-                size,
-                mtime_ns,
-                hash: hash.clone(),
-            },
-        );
-        self.dirty = true;
-        Ok(hash)
+        let hashed = self.compute(root, rel)?;
+        self.record(rel, hashed.stamp);
+        Ok(hashed.digest)
     }
+
+    fn compute(&self, root: &Path, rel: &Path) -> Result<Hashed> {
+        let path = root.join(rel);
+        let uncached = |digest: String| Hashed {
+            digest,
+            stamp: None,
+        };
+        let meta = match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(uncached(MISSING.into())),
+            Err(e) => return Err(input_error(rel, e)),
+            Ok(meta) => meta,
+        };
+        if meta.is_symlink() {
+            return symlink_digest(&path, rel).map(uncached);
+        }
+        if meta.is_dir() {
+            return Ok(uncached("dir".into()));
+        }
+        let stat = Stat::of(&meta);
+        let cached = rel
+            .to_str()
+            .and_then(|key| self.entries.get(key))
+            .filter(|stamp| stamp.stat == stat)
+            .map(|stamp| stamp.hash.clone());
+        let content = match cached.map_or_else(|| content_hash(&path), Ok) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(uncached(MISSING.into())),
+            Err(e) => return Err(input_error(rel, e)),
+            Ok(content) => content,
+        };
+        Ok(Hashed {
+            digest: file_digest(&meta, &content),
+            stamp: (!is_racy(&meta)).then_some(Stamp {
+                stat,
+                hash: content,
+            }),
+        })
+    }
+
+    fn record(&mut self, rel: &Path, stamp: Option<Stamp>) {
+        let Some(key) = rel.to_str() else { return };
+        self.seen.insert(key.to_string());
+        match stamp {
+            Some(stamp) if self.entries.get(key) != Some(&stamp) => {
+                self.entries.insert(key.to_string(), stamp);
+                self.dirty = true;
+            }
+            Some(_) => {}
+            None => self.dirty |= self.entries.remove(key).is_some(),
+        }
+    }
+}
+
+fn input_error(rel: &Path, source: io::Error) -> Error {
+    Error::Input {
+        path: rel.to_path_buf(),
+        source,
+    }
+}
+
+fn content_hash(path: &Path) -> io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(fs::File::open(path)?)?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn file_digest(meta: &Metadata, content: &str) -> String {
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = {
+        let _ = meta;
+        false
+    };
+    format!("file:{}:{content}", if executable { "x" } else { "-" })
+}
+
+/// The link text plus what it resolves to: a file's digest, `dir`, or `dangling` (which
+/// covers loops too).
+fn symlink_digest(path: &Path, rel: &Path) -> Result<String> {
+    let link = fs::read_link(path).map_err(|e| input_error(rel, e))?;
+    let target = match fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => "dir".to_string(),
+        Ok(meta) => match content_hash(path) {
+            Ok(content) => file_digest(&meta, &content),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => "dangling".into(),
+            Err(e) => return Err(input_error(rel, e)),
+        },
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(input_error(rel, e)),
+        Err(_) => "dangling".into(),
+    };
+    let mut fields = Fields::new();
+    fields.add("link", path_bytes(&link)).add("target", target);
+    Ok(format!("link:{}", fields.finish()))
+}
+
+fn is_racy(meta: &Metadata) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+        .is_none_or(|age| age < RACY_WINDOW)
 }
 
 /// Versions of the tools task commands use, probed once per run.
@@ -289,7 +446,6 @@ pub fn input_files(ws: &Workspace, project: &Project, target: &Target) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     fn no_env(_: &str) -> Option<OsString> {
         None
@@ -535,33 +691,245 @@ command = "make a"
         assert_ne!(key_of(dir.path(), "build", "."), before);
     }
 
-    #[test]
-    fn file_hashes_are_reused_while_size_and_mtime_match() {
+    const ONE: &str =
+        "[projects.\"libs/a\".targets.build]\ncommand = \"make\"\noutputs = [\"out/**\"]\n";
+
+    fn one_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("f.txt");
-        write(dir.path(), "f.txt", "one");
-        let mut cache = FileHashCache::default();
-        let first = cache.hash(dir.path(), Path::new("f.txt")).unwrap();
-        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
-        fs::write(&file, "two").unwrap();
+        write(dir.path(), "axonal.toml", ONE);
+        write(dir.path(), "libs/a/src/a.txt", "a");
+        dir
+    }
+
+    fn set_mtime(path: &Path, mtime: SystemTime) {
         fs::File::options()
             .write(true)
-            .open(&file)
+            .open(path)
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        assert_eq!(cache.hash(dir.path(), Path::new("f.txt")).unwrap(), first);
+    }
 
-        cache.save(dir.path()).unwrap();
-        let mut reloaded = FileHashCache::load(dir.path());
-        assert_eq!(
-            reloaded.hash(dir.path(), Path::new("f.txt")).unwrap(),
-            first
+    /// Moves the mtime out of the racy window so the stamp is cached.
+    fn back_date(path: &Path) -> SystemTime {
+        let mtime = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(path, mtime);
+        mtime
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_inputs_track_the_link_and_its_target() {
+        use std::os::unix::fs::symlink;
+        let dir = one_project();
+        write(dir.path(), "shared/config.json", "{\"v\":1}");
+        write(dir.path(), "shared/other.json", "{\"v\":1}");
+        let link = dir.path().join("libs/a/src/config.json");
+        symlink("../../../shared/config.json", &link).unwrap();
+        let ws = Workspace::discover(dir.path()).unwrap();
+        assert!(
+            ws.projects["libs/a"]
+                .files
+                .contains(&PathBuf::from("libs/a/src/config.json"))
         );
-        fs::write(&file, "three").unwrap();
+        let before = key_of(dir.path(), "build", "libs/a");
+        write(dir.path(), "shared/config.json", "{\"v\":2}");
+        let edited = key_of(dir.path(), "build", "libs/a");
+        assert_ne!(before, edited, "editing the target changes the key");
+        fs::remove_file(&link).unwrap();
+        symlink("../../../shared/other.json", &link).unwrap();
+        assert_ne!(
+            key_of(dir.path(), "build", "libs/a"),
+            edited,
+            "retargeting changes the key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_and_dangling_links_hash_without_errors() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("d")).unwrap();
+        symlink("d", dir.path().join("to-dir")).unwrap();
+        symlink("nowhere", dir.path().join("dangling")).unwrap();
+        let mut cache = FileHashCache::default();
+        let to_dir = cache.hash(dir.path(), Path::new("to-dir")).unwrap();
+        let dangling = cache.hash(dir.path(), Path::new("dangling")).unwrap();
+        assert_ne!(to_dir, dangling);
+        fs::remove_file(dir.path().join("dangling")).unwrap();
+        symlink("d", dir.path().join("dangling")).unwrap();
+        assert_ne!(
+            cache.hash(dir.path(), Path::new("dangling")).unwrap(),
+            dangling
+        );
+    }
+
+    #[test]
+    fn vanished_files_hash_as_missing() {
+        let dir = one_project();
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let graph = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        let key = |ws: &Workspace| {
+            task_keys(
+                ws,
+                &graph,
+                &mut FileHashCache::default(),
+                &Toolchain::default(),
+                &no_env,
+            )
+            .unwrap()[&TaskId::new("libs/a", "build")]
+                .clone()
+        };
+        let before = key(&ws);
+        fs::remove_file(dir.path().join("libs/a/src/a.txt")).unwrap();
+        assert_ne!(key(&ws), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_files_are_errors_naming_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = one_project();
+        let file = dir.path().join("libs/a/src/a.txt");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&file).is_ok() {
+            return; // running as root
+        }
+        let err = FileHashCache::default()
+            .hash(dir.path(), Path::new("libs/a/src/a.txt"))
+            .unwrap_err();
+        assert!(matches!(err, Error::Input { .. }), "{err:?}");
+        assert!(err.to_string().contains("libs/a/src/a.txt"), "{err}");
+    }
+
+    #[test]
+    fn file_hashes_are_reused_while_the_stamp_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f.txt", "one");
+        back_date(&dir.path().join("f.txt"));
+        let mut cache = FileHashCache::default();
+        let first = cache.hash(dir.path(), Path::new("f.txt")).unwrap();
+        cache.save(dir.path()).unwrap();
+
+        let mut reloaded = FileHashCache::load(dir.path());
+        reloaded.entries.get_mut("f.txt").unwrap().hash = "sentinel".into();
+        assert!(
+            reloaded
+                .hash(dir.path(), Path::new("f.txt"))
+                .unwrap()
+                .contains("sentinel"),
+            "an unchanged stamp reuses the stored hash"
+        );
+        write(dir.path(), "f.txt", "three");
+        let changed = reloaded.hash(dir.path(), Path::new("f.txt")).unwrap();
+        assert!(!changed.contains("sentinel"));
+        assert_ne!(changed, first);
+    }
+
+    #[test]
+    fn same_size_rewrites_with_a_restored_mtime_are_rehashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        write(dir.path(), "f.txt", "v1");
+        let mtime = back_date(&file);
+        let mut cache = FileHashCache::default();
+        let first = cache.hash(dir.path(), Path::new("f.txt")).unwrap();
+        cache.save(dir.path()).unwrap();
+        assert!(
+            FileHashCache::load(dir.path())
+                .entries
+                .contains_key("f.txt")
+        );
+
+        write(dir.path(), "f.txt", "v2");
+        set_mtime(&file, mtime);
+        let mut reloaded = FileHashCache::load(dir.path());
         assert_ne!(
             reloaded.hash(dir.path(), Path::new("f.txt")).unwrap(),
-            first
+            first,
+            "same size and mtime, newer ctime"
         );
+    }
+
+    #[test]
+    fn racy_files_are_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f.txt", "fresh");
+        let mut cache = FileHashCache::default();
+        cache.hash(dir.path(), Path::new("f.txt")).unwrap();
+        cache.save(dir.path()).unwrap();
+        assert!(
+            !FileHashCache::load(dir.path())
+                .entries
+                .contains_key("f.txt")
+        );
+    }
+
+    #[test]
+    fn other_cache_versions_load_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f.txt", "one");
+        back_date(&dir.path().join("f.txt"));
+        let mut cache = FileHashCache::default();
+        cache.hash(dir.path(), Path::new("f.txt")).unwrap();
+        cache.save(dir.path()).unwrap();
+        let path = dir.path().join(FILE_HASHES);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["version"] = (FILE_HASHES_VERSION + 1).into();
+        fs::write(&path, json.to_string()).unwrap();
+        assert!(FileHashCache::load(dir.path()).entries.is_empty());
+    }
+
+    #[test]
+    fn unseen_entries_are_pruned_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a.txt", "b.txt"] {
+            write(dir.path(), f, f);
+            back_date(&dir.path().join(f));
+        }
+        let mut cache = FileHashCache::default();
+        cache.hash(dir.path(), Path::new("a.txt")).unwrap();
+        cache.hash(dir.path(), Path::new("b.txt")).unwrap();
+        cache.save(dir.path()).unwrap();
+        let mut second = FileHashCache::load(dir.path());
+        second.hash(dir.path(), Path::new("a.txt")).unwrap();
+        second.save(dir.path()).unwrap();
+        let third = FileHashCache::load(dir.path());
+        assert_eq!(third.entries.keys().collect::<Vec<_>>(), ["a.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_hash_but_are_not_cached() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let rel = Path::new(std::ffi::OsStr::from_bytes(b"\xff.txt"));
+        // APFS rejects non-UTF-8 names; the path then hashes as missing.
+        let created = fs::write(dir.path().join(rel), "x").is_ok();
+        if created {
+            back_date(&dir.path().join(rel));
+        }
+        let mut cache = FileHashCache::default();
+        let digest = cache.hash(dir.path(), rel).unwrap();
+        assert_eq!(digest == MISSING, !created);
+        cache.save(dir.path()).unwrap();
+        assert!(FileHashCache::load(dir.path()).entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_executable_bit_changes_keys() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = one_project();
+        write(dir.path(), "libs/a/run.sh", "echo hi");
+        let before = key_of(dir.path(), "build", "libs/a");
+        fs::set_permissions(
+            dir.path().join("libs/a/run.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_ne!(key_of(dir.path(), "build", "libs/a"), before);
     }
 }

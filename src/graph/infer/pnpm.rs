@@ -68,6 +68,7 @@ pub fn discover(root: &Path, files: &[PathBuf]) -> Result<Vec<JsPackage>> {
     files
         .iter()
         .filter(|f| f.file_name().is_some_and(|n| n == "package.json"))
+        .filter(|f| root.join(f).is_file())
         .filter_map(|manifest| manifest.parent().map(|dir| (manifest, dir)))
         .filter(|(manifest, dir)| {
             if dir.as_os_str().is_empty() {
@@ -177,6 +178,23 @@ mod tests {
 
     fn discover_in(root: &Path) -> Result<Vec<JsPackage>> {
         discover(root, &crate::files::list(root).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_links_that_are_not_files_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, WORKSPACE_FILE, "packages:\n  - 'libs/*'\n");
+        write(root, "libs/a/package.json", r#"{"name":"a"}"#);
+        fs::create_dir_all(root.join("libs/b")).unwrap();
+        std::os::unix::fs::symlink("missing.json", root.join("libs/b/package.json")).unwrap();
+        let names: Vec<String> = discover_in(root)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["a"]);
     }
 
     #[test]

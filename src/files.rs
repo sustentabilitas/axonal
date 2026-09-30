@@ -25,9 +25,10 @@ fn is_skipped(entry: &DirEntry) -> bool {
         .is_some_and(|n| SKIPPED_DIRS.contains(&n))
 }
 
-/// Every file under `root` not ignored by the repo's own `.gitignore` files (global
-/// excludes, `.git/info/exclude` and `.ignore` files are not consulted), relative to
-/// `root` and sorted.
+/// Every file and symlink under `root` not ignored by the repo's own `.gitignore` files
+/// (global excludes, `.git/info/exclude` and `.ignore` files are not consulted), relative
+/// to `root` and sorted. Symlinks are listed, never followed, so directory links can't
+/// loop.
 pub fn list(root: &Path) -> Result<Vec<PathBuf>> {
     let walker = WalkBuilder::new(root)
         .hidden(false)
@@ -39,7 +40,9 @@ pub fn list(root: &Path) -> Result<Vec<PathBuf>> {
         .build();
     let mut files = walker
         .filter_map(|entry| match entry {
-            Ok(e) if e.file_type().is_some_and(|t| t.is_file()) => Some(Ok(e.into_path())),
+            Ok(e) if e.file_type().is_some_and(|t| t.is_file() || t.is_symlink()) => {
+                Some(Ok(e.into_path()))
+            }
             Ok(_) => None,
             Err(err) => Some(Err(Error::Io(std::io::Error::other(err)))),
         })
@@ -245,6 +248,28 @@ mod tests {
         assert_eq!(
             list(dir.path()).unwrap(),
             paths(&[".eslintrc.json", ".gitignore", "src/a.ts"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_keeps_symlinks_without_following_directory_links() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "real/a.txt");
+        symlink("real/a.txt", dir.path().join("file-link")).unwrap();
+        symlink("real", dir.path().join("dir-link")).unwrap();
+        symlink(".", dir.path().join("real/loop")).unwrap();
+        symlink("nowhere", dir.path().join("dangling")).unwrap();
+        assert_eq!(
+            list(dir.path()).unwrap(),
+            paths(&[
+                "dangling",
+                "dir-link",
+                "file-link",
+                "real/a.txt",
+                "real/loop"
+            ])
         );
     }
 
