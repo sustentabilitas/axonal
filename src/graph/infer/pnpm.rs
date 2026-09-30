@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::{
     config::TargetConfig,
     error::{Error, Result},
+    files,
 };
 
 pub const WORKSPACE_FILE: &str = "pnpm-workspace.yaml";
@@ -121,9 +122,7 @@ fn read_package(root: &Path, dir: &Path) -> Result<JsPackage> {
     .map(str::to_string)
     .collect();
     Ok(JsPackage {
-        name: pkg
-            .name
-            .unwrap_or_else(|| dir.to_string_lossy().into_owned()),
+        name: pkg.name.unwrap_or_else(|| files::display_root(dir)),
         root: dir.to_path_buf(),
         scripts: pkg.scripts,
         workspace_deps,
@@ -242,6 +241,14 @@ mod tests {
         write(dir.path(), WORKSPACE_FILE, "packages: ['apps/*']\n");
         write(dir.path(), "apps/site/package.json", "{}");
         assert_eq!(discover_in(dir.path()).unwrap()[0].name, "apps/site");
+    }
+
+    #[test]
+    fn root_package_without_a_name_is_named_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), WORKSPACE_FILE, "packages: ['.']\n");
+        write(dir.path(), "package.json", "{}");
+        assert_eq!(discover_in(dir.path()).unwrap()[0].name, ".");
     }
 
     #[test]

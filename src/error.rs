@@ -18,8 +18,12 @@ pub enum Error {
     UnknownTarget(String),
     #[error("target `{target}` of project `{project}` has no command")]
     MissingCommand { project: String, target: String },
+    #[error("unknown task `{0}`")]
+    UnknownTask(String),
     #[error("dependency cycle: {0}")]
     Cycle(String),
+    #[error("`{task}` depends on persistent task `{dependency}`, which never finishes")]
+    PersistentDependency { task: String, dependency: String },
     #[error("{tool}: {message}")]
     Tool { tool: String, message: String },
     #[error("git: {0}")]
