@@ -9,8 +9,9 @@ use std::{
     hash::Hash,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     rc::Rc,
+    sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -466,42 +467,75 @@ fn run_probes(dir: &Path, probes: &[Probe], timeout: Duration) -> BTreeMap<&'sta
     })
 }
 
-/// Version output is small, so the child never blocks on a full stdout pipe before exit.
+/// Runs `p` in its own process group, killing the whole group at the deadline. Stdout is
+/// read on a detached thread, since a grandchild can hold the pipe open after the child
+/// exits.
 fn probe(dir: &Path, p: &Probe, timeout: Duration) -> String {
-    let Ok(mut child) = Command::new(p.program)
+    let deadline = Instant::now() + timeout;
+    let mut command = Command::new(p.program);
+    command
         .args(p.args)
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let Ok(mut child) = command.spawn() else {
         return "missing".into();
     };
-    let deadline = Instant::now() + timeout;
+    let stdout = child.stdout.take().map(|mut out| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = tx.send(out.read_to_string(&mut text).map(|_| text));
+        });
+        rx
+    });
     let status = loop {
         match child.try_wait() {
             Ok(None) if Instant::now() < deadline => std::thread::sleep(PROBE_POLL),
             Ok(None) => {
-                // A failed kill means the child already exited; `wait` reaps it either way.
-                let _ = child.kill();
-                let _ = child.wait();
+                kill(&mut child);
                 return "timeout".into();
             }
             Ok(Some(status)) => break status,
-            Err(_) => return "missing".into(),
+            Err(_) => {
+                kill(&mut child);
+                return "missing".into();
+            }
         }
     };
-    let mut stdout = String::new();
-    match child
-        .stdout
-        .take()
-        .map(|mut out| out.read_to_string(&mut stdout))
-    {
-        Some(Ok(_)) if status.success() => stdout.trim().to_string(),
+    match stdout.map(|rx| rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))) {
+        Some(Ok(Ok(text))) if status.success() => text.trim().to_string(),
+        Some(Err(mpsc::RecvTimeoutError::Timeout)) => {
+            kill_group(&child);
+            "timeout".into()
+        }
         _ => "missing".into(),
     }
 }
+
+/// Kills the probe and everything it spawned, then reaps it.
+fn kill(child: &mut Child) {
+    kill_group(child);
+    // A failed kill means the child already exited; `wait` reaps it either way.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The group id is the probe's pid, which isn't reused while any group member lives, even
+/// after the probe itself is reaped.
+#[cfg(unix)]
+fn kill_group(child: &Child) {
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: `killpg` only sends a signal; ESRCH for an empty group is harmless.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_: &Child) {}
 
 /// Looks up an environment variable; production callers pass `std::env::var_os`.
 pub type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
@@ -2078,6 +2112,25 @@ inputs = ["src/**"]
         );
         assert_eq!(versions["slow"], "timeout");
         assert_eq!(versions["also_slow"], "timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grandchildren_holding_stdout_open_cannot_outlast_the_deadline() {
+        let probes = [Probe {
+            name: "forks",
+            program: "sh",
+            args: &["-c", "(sleep 4) & echo 1.0"],
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let versions = run_probes(dir.path(), &probes, Duration::from_millis(500));
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(versions["forks"], "timeout");
     }
 
     /// `cargo test --release hash::tests::scale -- --ignored --nocapture`; set
