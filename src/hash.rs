@@ -7,11 +7,11 @@ use std::{
     fmt,
     fs::{self, Metadata},
     hash::Hash,
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     rc::Rc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rayon::prelude::*;
@@ -287,26 +287,25 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
-    /// Node and pnpm for JS workspaces, rustc for Cargo ones. A tool that is missing or
-    /// fails hashes as `missing`.
+    /// Node and pnpm for JS workspaces, rustc for Cargo ones, run in parallel from the
+    /// workspace root (so `rust-toolchain.toml`, corepack and version managers apply). A
+    /// tool that is missing or fails hashes as `missing`; one still running after
+    /// five seconds is killed and hashes as `timeout`.
     pub fn detect(ws: &Workspace) -> Toolchain {
         let uses = |kind: Kind, manifest: &str| {
             ws.root.join(manifest).is_file()
                 || ws.projects.values().any(|p| p.kinds.contains(&kind))
         };
-        let js: &[(&'static str, &'static [&'static str])] =
-            &[("node", &["--version"]), ("pnpm", &["--version"])];
-        let cargo: &[(&'static str, &'static [&'static str])] = &[("rustc", &["-vV"])];
+        let probes: Vec<Probe> = [
+            (uses(Kind::Js, "package.json"), &JS_PROBES[..]),
+            (uses(Kind::Cargo, "Cargo.toml"), &CARGO_PROBES[..]),
+        ]
+        .into_iter()
+        .filter(|(used, _)| *used)
+        .flat_map(|(_, probes)| probes.iter().cloned())
+        .collect();
         Toolchain {
-            versions: [
-                (uses(Kind::Js, "package.json"), js),
-                (uses(Kind::Cargo, "Cargo.toml"), cargo),
-            ]
-            .into_iter()
-            .filter(|(used, _)| *used)
-            .flat_map(|(_, probes)| probes)
-            .map(|(tool, args)| (*tool, probe(tool, args)))
-            .collect(),
+            versions: run_probes(&ws.root, &probes, PROBE_TIMEOUT),
         }
     }
 
@@ -326,14 +325,82 @@ impl Toolchain {
     }
 }
 
-fn probe(tool: &str, args: &[&str]) -> String {
-    Command::new(tool)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "missing".into())
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_POLL: Duration = Duration::from_millis(10);
+
+/// A version command; its trimmed stdout is hashed under `name`.
+#[derive(Debug, Clone)]
+struct Probe {
+    name: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+const JS_PROBES: [Probe; 2] = [
+    Probe {
+        name: "node",
+        program: "node",
+        args: &["--version"],
+    },
+    Probe {
+        name: "pnpm",
+        program: "pnpm",
+        args: &["--version"],
+    },
+];
+const CARGO_PROBES: [Probe; 1] = [Probe {
+    name: "rustc",
+    program: "rustc",
+    args: &["-vV"],
+}];
+
+fn run_probes(dir: &Path, probes: &[Probe], timeout: Duration) -> BTreeMap<&'static str, String> {
+    std::thread::scope(|scope| {
+        probes
+            .iter()
+            .map(|p| (p.name, scope.spawn(move || probe(dir, p, timeout))))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(name, handle)| (name, handle.join().unwrap_or_else(|_| "missing".into())))
+            .collect()
+    })
+}
+
+/// Version output is small, so the child never blocks on a full stdout pipe before exit.
+fn probe(dir: &Path, p: &Probe, timeout: Duration) -> String {
+    let Ok(mut child) = Command::new(p.program)
+        .args(p.args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return "missing".into();
+    };
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(PROBE_POLL),
+            Ok(None) => {
+                // A failed kill means the child already exited; `wait` reaps it either way.
+                let _ = child.kill();
+                let _ = child.wait();
+                return "timeout".into();
+            }
+            Ok(Some(status)) => break status,
+            Err(_) => return "missing".into(),
+        }
+    };
+    let mut stdout = String::new();
+    match child
+        .stdout
+        .take()
+        .map(|mut out| out.read_to_string(&mut stdout))
+    {
+        Some(Ok(_)) if status.success() => stdout.trim().to_string(),
+        _ => "missing".into(),
+    }
 }
 
 /// Looks up an environment variable; production callers pass `std::env::var_os`.
@@ -1378,6 +1445,62 @@ command = "make a"
             r#"{"name":"p","version":"2.0.0","scripts":{"build":"tsc"}}"#,
         );
         assert_ne!(key_of(dir.path(), "build", "p"), before);
+    }
+
+    #[test]
+    fn missing_tools_probe_as_missing() {
+        let probes = [Probe {
+            name: "nope",
+            program: "axonal-no-such-tool",
+            args: &[],
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            run_probes(dir.path(), &probes, Duration::from_secs(5))["nope"],
+            "missing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probes_run_in_the_workspace_root() {
+        let probes = [Probe {
+            name: "cwd",
+            program: "sh",
+            args: &["-c", "pwd -P"],
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            run_probes(dir.path(), &probes, Duration::from_secs(5))["cwd"],
+            dir.path().canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_probes_time_out_and_run_in_parallel() {
+        let probes = [
+            Probe {
+                name: "slow",
+                program: "sleep",
+                args: &["30"],
+            },
+            Probe {
+                name: "also_slow",
+                program: "sleep",
+                args: &["30"],
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let versions = run_probes(dir.path(), &probes, Duration::from_millis(300));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(versions["slow"], "timeout");
+        assert_eq!(versions["also_slow"], "timeout");
     }
 
     /// `cargo test --release hash::tests::scale -- --ignored --nocapture`; set
