@@ -10,8 +10,9 @@ use std::{
 
 use serde::Serialize;
 
+pub use crate::files::display_root;
 use crate::{
-    config::{self, Config, DepsUsage, TargetConfig},
+    config::{self, Config, DepsUsage, ProjectConfig, TargetConfig},
     error::{Error, Result},
     files::{self, Owners},
 };
@@ -121,11 +122,7 @@ impl Workspace {
         let root = root.canonicalize()?;
         let config = Config::load(&root)?;
         let files = files::list(&root)?;
-        let declared = config
-            .projects
-            .iter()
-            .map(|(key, project)| project_path(key).map(|path| (path, project)))
-            .collect::<Result<BTreeMap<_, _>>>()?;
+        let declared = declared_projects(&config)?;
 
         let mut drafts: BTreeMap<PathBuf, Draft> = BTreeMap::new();
         for c in cargo::discover(&root)? {
@@ -157,7 +154,7 @@ impl Workspace {
             });
         }
 
-        let names = name_projects(&drafts)?;
+        let names = name_projects(&drafts, &declared)?;
         let roots_by_name: BTreeMap<&str, &PathBuf> = names
             .iter()
             .map(|(root, name)| (name.as_str(), root))
@@ -166,13 +163,7 @@ impl Workspace {
             let deps = project
                 .deps
                 .iter()
-                .map(|dep| {
-                    project_path(dep)
-                        .ok()
-                        .filter(|p| drafts.contains_key(p))
-                        .or_else(|| roots_by_name.get(dep.as_str()).map(|r| (*r).clone()))
-                        .ok_or_else(|| Error::UnknownProject(dep.clone()))
-                })
+                .map(|dep| resolve_dep(dep, path, &names, &roots_by_name))
                 .collect::<Result<Vec<_>>>()?;
             drafts
                 .get_mut(path)
@@ -286,15 +277,69 @@ fn project_path(key: &str) -> Result<PathBuf> {
     })
 }
 
-fn name_projects(drafts: &BTreeMap<PathBuf, Draft>) -> Result<BTreeMap<PathBuf, String>> {
+/// `[projects]` entries by normalised path; two keys for one path are an error.
+fn declared_projects(config: &Config) -> Result<BTreeMap<PathBuf, &ProjectConfig>> {
+    let mut keys: BTreeMap<PathBuf, &str> = BTreeMap::new();
+    config
+        .projects
+        .iter()
+        .map(|(key, project)| {
+            let path = project_path(key)?;
+            match keys.insert(path.clone(), key) {
+                Some(first) => Err(Error::Config {
+                    path: PathBuf::from(config::FILE),
+                    message: format!(
+                        "projects `{first}` and `{key}` are the same path `{}`",
+                        display_root(&path)
+                    ),
+                }),
+                None => Ok((path, project)),
+            }
+        })
+        .collect()
+}
+
+/// The root of the project an explicit `deps` entry names, by path or by final name.
+fn resolve_dep(
+    dep: &str,
+    owner: &Path,
+    names: &BTreeMap<PathBuf, String>,
+    roots_by_name: &BTreeMap<&str, &PathBuf>,
+) -> Result<PathBuf> {
+    let by_path = project_path(dep).ok().filter(|p| names.contains_key(p));
+    let by_name = roots_by_name.get(dep).map(|r| (*r).clone());
+    match (by_path, by_name) {
+        (Some(path), Some(named)) if path != named => Err(Error::Config {
+            path: PathBuf::from(config::FILE),
+            message: format!(
+                "dep `{dep}` of `{}` is ambiguous: it is the path of `{}` and the name of the project at `{}`",
+                display_root(owner),
+                names[&path],
+                display_root(&named)
+            ),
+        }),
+        (by_path, by_name) => by_path
+            .or(by_name)
+            .ok_or_else(|| Error::UnknownProject(dep.into())),
+    }
+}
+
+/// A declared name wins, then the package name, the crate name and the path.
+fn name_projects(
+    drafts: &BTreeMap<PathBuf, Draft>,
+    declared: &BTreeMap<PathBuf, &ProjectConfig>,
+) -> Result<BTreeMap<PathBuf, String>> {
     let mut seen: BTreeMap<String, &Path> = BTreeMap::new();
     drafts
         .iter()
         .map(|(root, draft)| {
-            let name = draft
-                .js_name
-                .clone()
-                .or_else(|| draft.crate_name.clone())
+            let name = declared
+                .get(root)
+                .and_then(|p| p.name.clone())
+                .into_iter()
+                .chain(draft.js_name.clone())
+                .chain(draft.crate_name.clone())
+                .find(|n| !n.is_empty())
                 .unwrap_or_else(|| display_root(root));
             if let Some(first) = seen.insert(name.clone(), root) {
                 return Err(Error::DuplicateProject {
@@ -332,15 +377,6 @@ fn resolve_targets(
             Target::finalize(project, name, merged).map(|t| (name.clone(), t))
         })
         .collect()
-}
-
-/// `.` for the workspace root, else the relative path.
-pub fn display_root(root: &Path) -> String {
-    if root.as_os_str().is_empty() {
-        ".".into()
-    } else {
-        root.to_string_lossy().into_owned()
-    }
 }
 
 pub fn to_dot(ws: &Workspace) -> String {
@@ -515,6 +551,142 @@ outputs = []
             Workspace::discover(dir.path()),
             Err(Error::UnknownProject(name)) if name == "ghost"
         ));
+    }
+
+    #[test]
+    fn duplicate_project_paths_are_a_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.\"libs/a\"]\n\n[projects.\"./libs/a/\"]\n",
+        );
+        match Workspace::discover(dir.path()) {
+            Err(Error::Config { message, .. }) => {
+                assert!(message.contains("`libs/a`"), "{message}");
+                assert!(message.contains("`./libs/a/`"), "{message}");
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unnamed_root_package_is_named_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "pnpm-workspace.yaml", "packages: ['.']\n");
+        for manifest in ["{}", r#"{"name":""}"#] {
+            write(dir.path(), "package.json", manifest);
+            let ws = Workspace::discover(dir.path()).unwrap();
+            assert_eq!(ws.projects.keys().collect::<Vec<_>>(), ["."], "{manifest}");
+        }
+    }
+
+    #[test]
+    fn declared_names_resolve_collisions_and_name_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"3\"\n",
+        );
+        write(
+            dir.path(),
+            "crates/core/Cargo.toml",
+            "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        write(dir.path(), "crates/core/src/lib.rs", "");
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages: ['packages/*']\n",
+        );
+        write(
+            dir.path(),
+            "packages/core/package.json",
+            r#"{"name":"core"}"#,
+        );
+        assert!(matches!(
+            Workspace::discover(dir.path()),
+            Err(Error::DuplicateProject { name, .. }) if name == "core"
+        ));
+
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.\"crates/core\"]\nname = \"core-rs\"\n\n[projects.\"packages/core\"]\ndeps = [\"core-rs\"]\n",
+        );
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let rs = &ws.projects["core-rs"];
+        assert_eq!(rs.crate_name.as_deref(), Some("core"));
+        assert_eq!(rs.kinds, BTreeSet::from([Kind::Cargo]));
+        assert_eq!(rs.targets["test"].command, "cargo test -p core");
+        assert_eq!(
+            ws.projects["core"].deps,
+            BTreeSet::from(["core-rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn deps_naming_one_project_by_path_and_another_by_name_are_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "pnpm-workspace.yaml", "packages: ['ui']\n");
+        write(dir.path(), "ui/package.json", r#"{"name":"@acme/ui"}"#);
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.tools]\nname = \"ui\"\n\n[projects.app]\ndeps = [\"ui\"]\n",
+        );
+        match Workspace::discover(dir.path()) {
+            Err(Error::Config { message, .. }) => {
+                assert!(message.contains("ambiguous"), "{message}");
+                assert!(message.contains("@acme/ui"), "{message}");
+                assert!(message.contains("tools"), "{message}");
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
+
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.ui]\nname = \"ui\"\n\n[projects.app]\ndeps = [\"ui\"]\n",
+        );
+        let ws = Workspace::discover(dir.path()).unwrap();
+        assert_eq!(ws.projects["app"].deps, BTreeSet::from(["ui".to_string()]));
+    }
+
+    #[test]
+    fn explicit_config_merges_into_an_inferred_project() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "pnpm-workspace.yaml", "packages: ['libs/*']\n");
+        write(
+            dir.path(),
+            "libs/ui/package.json",
+            r#"{"name":"@acme/ui","scripts":{"build":"tsc"}}"#,
+        );
+        write(
+            dir.path(),
+            "axonal.toml",
+            r#"
+[projects."libs/ui"]
+deps = ["tools"]
+
+[projects."libs/ui".targets.build]
+outputs = ["dist/**"]
+
+[projects."libs/ui".targets.lint]
+command = "eslint ."
+
+[projects.tools.targets.build]
+command = "true"
+"#,
+        );
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let ui = &ws.projects["@acme/ui"];
+        assert_eq!(ui.kinds, BTreeSet::from([Kind::Js]));
+        assert_eq!(ui.deps, BTreeSet::from(["tools".to_string()]));
+        assert_eq!(ui.targets["build"].command, "pnpm run build");
+        assert_eq!(ui.targets["build"].outputs, vec!["dist/**".to_string()]);
+        assert_eq!(ui.targets["lint"].command, "eslint .");
     }
 
     #[test]

@@ -92,6 +92,15 @@ pub fn normalize(path: &Path) -> Option<PathBuf> {
     })
 }
 
+/// `.` for the workspace root, else the relative path.
+pub fn display_root(root: &Path) -> String {
+    if root.as_os_str().is_empty() {
+        ".".into()
+    } else {
+        root.to_string_lossy().into_owned()
+    }
+}
+
 /// A target's `inputs` or `outputs`, split into project-relative and `{workspace}/` globs.
 #[derive(Debug, Clone)]
 pub struct Patterns {
@@ -266,6 +275,12 @@ mod tests {
         assert_eq!(normalize(Path::new(".")), Some(PathBuf::new()));
         assert_eq!(normalize(Path::new("../x")), None);
         assert_eq!(normalize(Path::new("/etc")), None);
+    }
+
+    #[test]
+    fn display_root_names_the_workspace_root_dot() {
+        assert_eq!(display_root(Path::new("")), ".");
+        assert_eq!(display_root(Path::new("libs/a")), "libs/a");
     }
 
     #[test]

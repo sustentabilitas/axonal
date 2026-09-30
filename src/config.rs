@@ -96,6 +96,8 @@ impl TargetConfig {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
+    /// Replaces the inferred name (package, crate or path), e.g. to resolve a collision.
+    pub name: Option<String>,
     #[serde(default)]
     pub deps: Vec<String>,
     #[serde(default)]
@@ -239,6 +241,17 @@ mode = "shadow"
         assert!(msg.contains("axonal.toml"), "{msg}");
         assert!(msg.contains("line 3"), "{msg}");
         assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    #[test]
+    fn projects_can_override_their_name() {
+        let c = Config::parse(
+            "[projects.\"crates/core\"]\nname = \"core-rs\"\n",
+            Path::new(FILE),
+        )
+        .unwrap();
+        assert_eq!(c.projects["crates/core"].name.as_deref(), Some("core-rs"));
+        assert!(Config::parse("[projects.x]\nnmae = \"y\"\n", Path::new(FILE)).is_err());
     }
 
     #[test]
