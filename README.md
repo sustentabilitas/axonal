@@ -2,7 +2,10 @@
 
 A fast, simple monorepo task runner for pnpm and Cargo workspaces. axonal infers
 projects and dependencies from the manifests you already have, runs tasks in
-dependency order with a local cache, and knows which tasks a change affects.
+dependency order with a local cache, and works out which projects a change
+affects so you only run their tasks.
+
+axonal is in early development; commands and configuration may change.
 
 ```sh
 axonal graph                    # projects, dependencies and targets
