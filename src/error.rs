@@ -28,6 +28,11 @@ pub enum Error {
     Tool { tool: String, message: String },
     #[error("git: {0}")]
     Git(String),
+    #[error("cannot hash input {}: {source}", path.display())]
+    Input {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

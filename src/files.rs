@@ -25,9 +25,10 @@ fn is_skipped(entry: &DirEntry) -> bool {
         .is_some_and(|n| SKIPPED_DIRS.contains(&n))
 }
 
-/// Every file under `root` not ignored by the repo's own `.gitignore` files (global
-/// excludes, `.git/info/exclude` and `.ignore` files are not consulted), relative to
-/// `root` and sorted.
+/// Every file and symlink under `root` not ignored by the repo's own `.gitignore` files
+/// (global excludes, `.git/info/exclude` and `.ignore` files are not consulted), relative
+/// to `root` and sorted. Symlinks are listed, never followed, so directory links can't
+/// loop.
 pub fn list(root: &Path) -> Result<Vec<PathBuf>> {
     let walker = WalkBuilder::new(root)
         .hidden(false)
@@ -39,7 +40,9 @@ pub fn list(root: &Path) -> Result<Vec<PathBuf>> {
         .build();
     let mut files = walker
         .filter_map(|entry| match entry {
-            Ok(e) if e.file_type().is_some_and(|t| t.is_file()) => Some(Ok(e.into_path())),
+            Ok(e) if e.file_type().is_some_and(|t| t.is_file() || t.is_symlink()) => {
+                Some(Ok(e.into_path()))
+            }
             Ok(_) => None,
             Err(err) => Some(Err(Error::Io(std::io::Error::other(err)))),
         })
@@ -148,6 +151,20 @@ impl Patterns {
         self.workspace.is_match(path)
     }
 
+    pub fn has_workspace_globs(&self) -> bool {
+        !self.workspace_globs.is_empty()
+    }
+
+    /// Project-relative globs without metacharacters: each names a single path.
+    pub fn project_literals(&self) -> impl Iterator<Item = &str> {
+        literals(&self.project_globs)
+    }
+
+    /// `{workspace}/` globs (prefix stripped) without metacharacters.
+    pub fn workspace_literals(&self) -> impl Iterator<Item = &str> {
+        literals(&self.workspace_globs)
+    }
+
     /// Existing files matching these globs, found by walking each glob's literal base
     /// directory without gitignore filtering (outputs are usually ignored).
     /// Workspace-relative and sorted.
@@ -184,6 +201,13 @@ impl Patterns {
         }
         Ok(found.into_iter().collect())
     }
+}
+
+fn literals(globs: &[String]) -> impl Iterator<Item = &str> {
+    globs
+        .iter()
+        .map(String::as_str)
+        .filter(|g| !g.contains(['*', '?', '[', ']', '{', '}', '\\']))
 }
 
 fn glob_set(globs: &[String]) -> Result<GlobSet> {
@@ -248,6 +272,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn list_keeps_symlinks_without_following_directory_links() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "real/a.txt");
+        symlink("real/a.txt", dir.path().join("file-link")).unwrap();
+        symlink("real", dir.path().join("dir-link")).unwrap();
+        symlink(".", dir.path().join("real/loop")).unwrap();
+        symlink("nowhere", dir.path().join("dangling")).unwrap();
+        assert_eq!(
+            list(dir.path()).unwrap(),
+            paths(&[
+                "dangling",
+                "dir-link",
+                "file-link",
+                "real/a.txt",
+                "real/loop"
+            ])
+        );
+    }
+
     #[test]
     fn owner_is_the_deepest_root() {
         let owners = Owners::new(paths(&["", "apps", "apps/web"]));
@@ -290,6 +336,26 @@ mod tests {
         assert!(!p.matches_project(Path::new("test/a.ts")));
         assert!(p.matches_workspace(Path::new("pnpm-lock.yaml")));
         assert!(!p.matches_workspace(Path::new("src/a.ts")));
+        assert!(p.has_workspace_globs());
+        assert!(
+            !Patterns::new(&["src/**".into()])
+                .unwrap()
+                .has_workspace_globs()
+        );
+    }
+
+    #[test]
+    fn literals_are_globs_without_metacharacters() {
+        let p = Patterns::new(&[
+            "src/**".into(),
+            ".env.local".into(),
+            "a/{b,c}".into(),
+            "{workspace}/.npmrc".into(),
+            "{workspace}/*.lock".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.project_literals().collect::<Vec<_>>(), [".env.local"]);
+        assert_eq!(p.workspace_literals().collect::<Vec<_>>(), [".npmrc"]);
     }
 
     #[test]
