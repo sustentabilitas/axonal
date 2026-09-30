@@ -2,6 +2,9 @@
 //! overridden and extended by `axonal.toml`.
 
 pub mod infer;
+pub mod tasks;
+
+pub use tasks::{TaskGraph, TaskId};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -245,6 +248,10 @@ impl Workspace {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    pub fn target(&self, id: &TaskId) -> &Target {
+        &self.projects[&id.project].targets[&id.target]
     }
 
     pub fn check_projects(&self, names: &BTreeSet<String>) -> Result<()> {
