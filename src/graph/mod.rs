@@ -231,7 +231,7 @@ impl Workspace {
                 Ok::<_, Error>((name, project))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        check_depends_on(&projects)?;
+        check_depends_on(&projects, &config.targets)?;
 
         Ok(Workspace {
             root,
@@ -409,30 +409,44 @@ fn resolve_targets(
         .collect()
 }
 
-/// Every `depends_on` entry, with or without `^`, must name a target some project defines.
-fn check_depends_on(projects: &BTreeMap<String, Project>) -> Result<()> {
-    let defined: BTreeSet<&str> = projects
+/// Every `depends_on` entry, with or without `^`, must name a target some project defines
+/// or `[targets]` declares, so shared defaults work in repos that lack the target.
+fn check_depends_on(
+    projects: &BTreeMap<String, Project>,
+    defaults: &BTreeMap<String, TargetConfig>,
+) -> Result<()> {
+    let known: BTreeSet<&str> = projects
         .values()
-        .flat_map(|p| p.targets.keys().map(String::as_str))
+        .flat_map(|p| p.targets.keys())
+        .chain(defaults.keys())
+        .map(String::as_str)
         .collect();
     projects
         .values()
         .flat_map(|p| {
             p.targets.iter().flat_map(move |(name, target)| {
-                target.depends_on.iter().map(move |dep| (p, name, dep))
+                target
+                    .depends_on
+                    .iter()
+                    .map(move |dep| (p, name, dep.strip_prefix('^').unwrap_or(dep), dep))
             })
         })
-        .find(|(_, _, dep)| {
-            let target = dep.strip_prefix('^').unwrap_or(dep);
-            target.is_empty() || !defined.contains(target)
-        })
-        .map_or(Ok(()), |(p, name, dep)| {
+        .find(|(_, _, target, _)| target.is_empty() || !known.contains(target))
+        .map_or(Ok(()), |(p, name, target, dep)| {
+            let message = if target.is_empty() {
+                format!(
+                    "target `{name}` of project `{}` has an empty `depends_on` entry",
+                    p.name
+                )
+            } else {
+                format!(
+                    "target `{name}` of project `{}` depends on `{dep}`, which no project or `[targets]` entry defines",
+                    p.name
+                )
+            };
             Err(Error::Config {
                 path: PathBuf::from(config::FILE),
-                message: format!(
-                    "target `{name}` of project `{}` depends on `{dep}`, which no project defines",
-                    p.name
-                ),
+                message,
             })
         })
 }
@@ -800,7 +814,7 @@ command = "true"
                  [projects.\"libs/b\".targets.lint]\ncommand = \"eslint .\"\n"
             )
         };
-        for entry in ["biuld", "^biuld", "^", ""] {
+        for entry in ["biuld", "^biuld"] {
             write(dir.path(), "axonal.toml", &config(&format!("\"{entry}\"")));
             match Workspace::discover(dir.path()) {
                 Err(Error::Config { message, .. }) => {
@@ -811,6 +825,16 @@ command = "true"
                 other => panic!("expected a config error for {entry:?}, got {other:?}"),
             }
         }
+        for entry in ["^", ""] {
+            write(dir.path(), "axonal.toml", &config(&format!("\"{entry}\"")));
+            match Workspace::discover(dir.path()) {
+                Err(Error::Config { message, .. }) => assert_eq!(
+                    message,
+                    "target `test` of project `libs/a` has an empty `depends_on` entry"
+                ),
+                other => panic!("expected a config error for {entry:?}, got {other:?}"),
+            }
+        }
 
         write(
             dir.path(),
@@ -818,6 +842,27 @@ command = "true"
             &config(r#""build", "^build", "^lint""#),
         );
         assert!(Workspace::discover(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn depends_on_may_name_targets_declared_only_in_target_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "axonal.toml",
+            r#"
+[targets.build]
+depends_on = ["^build"]
+
+[targets.test]
+depends_on = ["^build"]
+
+[projects."libs/a".targets.test]
+command = "make test"
+"#,
+        );
+        let ws = Workspace::discover(dir.path()).unwrap();
+        assert_eq!(ws.projects["libs/a"].targets["test"].depends_on, ["^build"]);
     }
 
     #[test]
