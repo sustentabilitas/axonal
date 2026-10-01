@@ -8,16 +8,18 @@ use std::{
     path::Path,
     pin::pin,
     process::{ExitStatus, Stdio},
-    sync::{Arc, Mutex, PoisonError},
-    time::Instant,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
 use tap::Tap;
+#[cfg(unix)]
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::{Child, Command},
-    task::{self, JoinSet},
+    task::{self, JoinError, JoinSet},
 };
 
 use crate::{
@@ -35,6 +37,13 @@ const MAX_LINE: u64 = 64 << 10;
 const MAX_LOGS: usize = 8 << 20;
 #[cfg(test)]
 const MAX_LOGS: usize = 1 << 20;
+/// How long stopped tasks get to exit after SIGTERM before they are killed.
+const GRACE: Duration = Duration::from_secs(5);
+/// How long processes a task left behind may hold its output open after its shell exits
+/// before they are killed.
+const DRAIN: Duration = Duration::from_millis(200);
+/// How often to check whether a shell has exited, should a SIGCHLD go astray.
+const EXIT_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -50,10 +59,12 @@ pub struct RunOptions {
 pub enum Outcome {
     Ran,
     CacheHit,
-    /// Exited non-zero, couldn't start, was interrupted, or its runner panicked.
+    /// Exited non-zero, couldn't start, was stopped by an interrupt, or its runner panicked.
     Failed,
     /// Not run because a dependency failed, or fail-fast or an interrupt stopped scheduling.
     Skipped,
+    /// A persistent task axonal stopped, on fail-fast or an interrupt.
+    Stopped,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +80,8 @@ pub struct TaskResult {
 pub struct RunReport {
     pub tasks: Vec<TaskResult>,
     pub warnings: Vec<String>,
+    /// Whether Ctrl-C or SIGTERM cut the run short.
+    pub interrupted: bool,
 }
 
 impl RunReport {
@@ -80,14 +93,21 @@ impl RunReport {
         u8::from(self.count(Outcome::Failed) + self.count(Outcome::Skipped) > 0)
     }
 
+    /// Stopped tasks are counted only when there are some.
     pub fn summary(&self) -> String {
+        let stopped = self.count(Outcome::Stopped);
         format!(
-            "{} tasks: {} ran, {} cache hits, {} failed, {} skipped",
+            "{} tasks: {} ran, {} cache hits, {} failed, {} skipped{}",
             self.tasks.len(),
             self.count(Outcome::Ran),
             self.count(Outcome::CacheHit),
             self.count(Outcome::Failed),
             self.count(Outcome::Skipped),
+            if stopped > 0 {
+                format!(", {stopped} stopped")
+            } else {
+                String::new()
+            },
         )
     }
 }
@@ -97,14 +117,21 @@ pub fn default_parallelism() -> usize {
 }
 
 /// Runs every task in `graph` once its dependencies have succeeded, at most `opts.parallel`
-/// at a time.
+/// at a time, through `sh -c` (`cmd /C` on Windows) in the project root. Tasks inherit
+/// axonal's whole environment, though only their listed `env` variables are hashed, and
+/// get a null stdin.
 ///
 /// Persistent tasks are never cached and take no slot, so servers that never exit can't
-/// starve the tasks around them; the run ends only once they exit.
+/// starve the tasks around them; the run ends only once they exit. After a failure without
+/// `keep_going`, they're stopped as soon as nothing else is running.
 ///
-/// Ctrl-C (and SIGTERM on Unix) interrupts the run: running tasks are killed and `Failed`,
-/// the rest `Skipped`. Dropping the future kills running tasks too. On Unix, killing a task
-/// kills its whole process group, so the processes it started go with it.
+/// On Unix each task runs in its own process group. Stopping tasks sends their groups
+/// SIGTERM and gives them [`GRACE`] to exit before killing them; a task whose shell exits
+/// while processes it left behind still hold its output has them killed after [`DRAIN`].
+/// Ctrl-C (and SIGTERM on Unix) stops every running task: persistent ones are `Stopped`,
+/// the rest `Failed`, the unstarted `Skipped`, and a second Ctrl-C kills at once. The
+/// signal handlers are installed when `run` is called and stay installed after it returns.
+/// Dropping the future kills every running task's group.
 ///
 /// # Panics
 ///
@@ -116,106 +143,211 @@ pub async fn run(
     store: Arc<dyn Store>,
     opts: &RunOptions,
 ) -> RunReport {
-    let dependents = graph.dependents();
-    let mut waiting: BTreeMap<&TaskId, usize> =
-        graph.deps.iter().map(|(id, d)| (id, d.len())).collect();
-    let mut ready: VecDeque<TaskId> = graph
-        .order
-        .iter()
-        .filter(|id| graph.deps.get(*id).is_none_or(BTreeSet::is_empty))
-        .cloned()
-        .collect();
-    let mut running = JoinSet::new();
-    let mut jobs: HashMap<task::Id, Started> = HashMap::new();
-    let mut busy = 0;
-    let mut results: BTreeMap<TaskId, TaskResult> = BTreeMap::new();
-    let mut warnings = Vec::new();
-    let mut stopped = false;
-    let mut interrupt = pin!(interrupted());
+    let mut interrupts = Interrupts::new();
+    let mut s = Scheduler::new(ws, graph, keys, store, opts);
+    let mut interrupted = false;
+    let mut deadline = None;
     loop {
-        if !stopped {
-            let is_persistent = |id: &TaskId| ws.get_target(id).is_some_and(|t| t.persistent);
-            let (persistent, rest): (VecDeque<_>, VecDeque<_>) =
-                ready.drain(..).partition(is_persistent);
-            ready = rest;
-            let free = opts.parallel.max(1).saturating_sub(busy).min(ready.len());
-            for id in persistent.into_iter().chain(ready.drain(..free)) {
-                let persistent = is_persistent(&id);
-                busy += usize::from(!persistent);
-                let job = Job {
-                    ws: ws.clone(),
-                    key: keys[&id].clone(),
-                    id: id.clone(),
-                    store: store.clone(),
-                    use_cache: opts.use_cache,
-                    to_stderr: opts.json,
-                };
-                let handle = running.spawn(job.execute());
-                jobs.insert(
-                    handle.id(),
-                    Started {
-                        task: id,
-                        persistent,
-                        at: Instant::now(),
-                    },
-                );
-            }
+        s.schedule();
+        if deadline.is_none() && s.stopped && s.busy == 0 && !s.running.is_empty() {
+            deadline = Some(s.stop());
         }
-        let joined = tokio::select! {
-            joined = running.join_next_with_id() => match joined {
-                Some(joined) => joined,
+        tokio::select! {
+            joined = s.running.join_next_with_id() => match joined {
+                Some(joined) => s.finish(joined),
                 None => break,
             },
-            () = &mut interrupt => {
-                warnings.push(format!("interrupted: killed {} running tasks", running.len()));
-                running.shutdown().await;
-                results.extend(
-                    jobs.drain()
-                        .map(|(_, s)| (s.task.clone(), s.failed(keys))),
-                );
-                break;
+            () = interrupts.recv() => {
+                interrupted = true;
+                if deadline.is_some() {
+                    break;
+                }
+                s.warnings.push("interrupted: stopping running tasks".into());
+                deadline = Some(s.stop());
             }
+            () = until(deadline) => break,
+        }
+    }
+    s.kill().await;
+    s.report(graph, interrupted)
+}
+
+/// Run state: what's ready, running and done.
+struct Scheduler<'a> {
+    ws: Arc<Workspace>,
+    keys: &'a BTreeMap<TaskId, Key>,
+    store: Arc<dyn Store>,
+    opts: &'a RunOptions,
+    dependents: BTreeMap<TaskId, BTreeSet<TaskId>>,
+    waiting: BTreeMap<&'a TaskId, usize>,
+    ready: VecDeque<TaskId>,
+    running: JoinSet<(TaskResult, Vec<String>)>,
+    jobs: HashMap<task::Id, Started>,
+    /// Running tasks that aren't persistent, which are those taking a slot.
+    busy: usize,
+    results: BTreeMap<TaskId, TaskResult>,
+    warnings: Vec<String>,
+    /// No more tasks are started, after a failure without `keep_going` or an interrupt.
+    stopped: bool,
+    groups: Groups,
+}
+
+impl<'a> Scheduler<'a> {
+    fn new(
+        ws: Arc<Workspace>,
+        graph: &'a TaskGraph,
+        keys: &'a BTreeMap<TaskId, Key>,
+        store: Arc<dyn Store>,
+        opts: &'a RunOptions,
+    ) -> Self {
+        Scheduler {
+            ws,
+            keys,
+            store,
+            opts,
+            dependents: graph.dependents(),
+            waiting: graph.deps.iter().map(|(id, d)| (id, d.len())).collect(),
+            ready: graph
+                .order
+                .iter()
+                .filter(|id| graph.deps.get(*id).is_none_or(BTreeSet::is_empty))
+                .cloned()
+                .collect(),
+            running: JoinSet::new(),
+            jobs: HashMap::new(),
+            busy: 0,
+            results: BTreeMap::new(),
+            warnings: Vec::new(),
+            stopped: false,
+            groups: Groups::default(),
+        }
+    }
+
+    /// Starts every ready persistent task and as many others as there are free slots.
+    fn schedule(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let ws = &self.ws;
+        let (persistent, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.ready)
+            .into_iter()
+            .partition(|id| is_persistent(ws, id));
+        self.ready = rest;
+        let free = (self.opts.parallel.max(1))
+            .saturating_sub(self.busy)
+            .min(self.ready.len());
+        let starting: Vec<_> = persistent
+            .into_iter()
+            .chain(self.ready.drain(..free))
+            .collect();
+        starting.into_iter().for_each(|id| self.start(id));
+    }
+
+    fn start(&mut self, id: TaskId) {
+        let persistent = is_persistent(&self.ws, &id);
+        self.busy += usize::from(!persistent);
+        let job = Job {
+            ws: self.ws.clone(),
+            key: self.keys[&id].clone(),
+            id: id.clone(),
+            store: self.store.clone(),
+            use_cache: self.opts.use_cache,
+            to_stderr: self.opts.json,
+            groups: self.groups.clone(),
         };
+        let handle = self.running.spawn(job.execute());
+        let started = Started {
+            task: id,
+            persistent,
+            at: Instant::now(),
+        };
+        self.jobs.insert(handle.id(), started);
+    }
+
+    /// Records a finished, aborted or panicked job, and readies what its success unblocks.
+    fn finish(&mut self, joined: Result<(task::Id, (TaskResult, Vec<String>)), JoinError>) {
         let id = match &joined {
             Ok((id, _)) => *id,
             Err(e) => e.id(),
         };
-        let Some(started) = jobs.remove(&id) else {
-            continue;
+        let Some(started) = self.jobs.remove(&id) else {
+            return;
         };
-        busy -= usize::from(!started.persistent);
-        let (result, mut job_warnings) = joined
-            .map(|(_, done)| done)
-            .unwrap_or_else(|e| (started.failed(keys), vec![format!("{}: {e}", started.task)]));
-        warnings.append(&mut job_warnings);
-        if result.outcome == Outcome::Failed {
-            stopped |= !opts.keep_going;
-        } else {
-            for dependent in dependents.get(&result.task).into_iter().flatten() {
-                if let Some(n) = waiting.get_mut(dependent) {
-                    *n -= 1;
-                    if *n == 0 {
-                        ready.push_back(dependent.clone());
+        self.busy -= usize::from(!started.persistent);
+        let (mut result, warnings) = match joined {
+            Ok((_, done)) => done,
+            Err(e) if e.is_panic() => (
+                started.failed(self.keys),
+                vec![format!("{}: {e}", started.task)],
+            ),
+            Err(_) => (started.failed(self.keys), vec![]),
+        };
+        if started.persistent && self.groups.is_stopping() {
+            result.outcome = Outcome::Stopped;
+        }
+        self.warnings.extend(warnings);
+        match result.outcome {
+            Outcome::Failed => self.stopped |= !self.opts.keep_going,
+            Outcome::Ran | Outcome::CacheHit => {
+                for dependent in self.dependents.get(&result.task).into_iter().flatten() {
+                    if let Some(n) = self.waiting.get_mut(dependent) {
+                        *n -= 1;
+                        if *n == 0 {
+                            self.ready.push_back(dependent.clone());
+                        }
                     }
                 }
             }
+            Outcome::Skipped | Outcome::Stopped => {}
         }
-        results.insert(result.task.clone(), result);
+        self.results.insert(result.task.clone(), result);
     }
-    let tasks = graph
-        .order
-        .iter()
-        .map(|id| {
-            results.remove(id).unwrap_or_else(|| TaskResult {
-                task: id.clone(),
-                outcome: Outcome::Skipped,
-                exit_code: None,
-                duration_ms: 0,
-                key: keys[id].clone(),
+
+    /// Stops scheduling and asks every running task to exit, returning when to kill them.
+    fn stop(&mut self) -> tokio::time::Instant {
+        self.stopped = true;
+        self.groups.stop();
+        tokio::time::Instant::now() + GRACE
+    }
+
+    /// Kills the tasks still running, keeping the results of any that already finished.
+    async fn kill(&mut self) {
+        if !self.running.is_empty() {
+            self.warnings.push(format!(
+                "killed {} tasks that didn't stop",
+                self.running.len()
+            ));
+        }
+        self.running.abort_all();
+        while let Some(joined) = self.running.join_next_with_id().await {
+            self.finish(joined);
+        }
+    }
+
+    fn report(mut self, graph: &TaskGraph, interrupted: bool) -> RunReport {
+        let tasks = graph
+            .order
+            .iter()
+            .map(|id| {
+                self.results.remove(id).unwrap_or_else(|| TaskResult {
+                    task: id.clone(),
+                    outcome: Outcome::Skipped,
+                    exit_code: None,
+                    duration_ms: 0,
+                    key: self.keys[id].clone(),
+                })
             })
-        })
-        .collect();
-    RunReport { tasks, warnings }
+            .collect();
+        RunReport {
+            tasks,
+            warnings: self.warnings,
+            interrupted,
+        }
+    }
+}
+
+fn is_persistent(ws: &Workspace, id: &TaskId) -> bool {
+    ws.get_target(id).is_some_and(|t| t.persistent)
 }
 
 /// A spawned job, for results it can't report itself.
@@ -237,35 +369,54 @@ impl Started {
     }
 }
 
-/// Resolves on Ctrl-C, or SIGINT or SIGTERM on Unix; never if no handler could be
-/// installed. Handlers are installed on the call, not the first poll.
-fn interrupted() -> impl Future<Output = ()> {
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending().await,
+    }
+}
+
+/// Ctrl-C, or SIGINT and SIGTERM on Unix, listened for from creation. Tokio never removes
+/// the handlers, so these signals no longer terminate the process afterwards.
+struct Interrupts {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{Signal, SignalKind, signal};
-        async fn received(signal: Option<Signal>) {
-            if let Some(mut signal) = signal
-                && signal.recv().await.is_some()
-            {
-                return;
-            }
-            pending().await
+    signals: [Option<Signal>; 2],
+}
+
+impl Interrupts {
+    fn new() -> Interrupts {
+        Interrupts {
+            #[cfg(unix)]
+            signals: [SignalKind::interrupt(), SignalKind::terminate()].map(|k| signal(k).ok()),
         }
-        let int = signal(SignalKind::interrupt()).ok();
-        let term = signal(SignalKind::terminate()).ok();
-        async move {
+    }
+
+    /// The next interrupt; never, if no handler could be installed.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            let [int, term] = &mut self.signals;
             tokio::select! {
                 () = received(int) => {}
                 () = received(term) => {}
             }
         }
-    }
-    #[cfg(not(unix))]
-    async {
+        #[cfg(not(unix))]
         if tokio::signal::ctrl_c().await.is_err() {
             pending().await
         }
     }
+}
+
+/// The next delivery of `signal`; never, without a handler.
+#[cfg(unix)]
+async fn received(signal: &mut Option<Signal>) {
+    if let Some(signal) = signal
+        && signal.recv().await.is_some()
+    {
+        return;
+    }
+    pending().await
 }
 
 struct Job {
@@ -275,6 +426,7 @@ struct Job {
     store: Arc<dyn Store>,
     use_cache: bool,
     to_stderr: bool,
+    groups: Groups,
 }
 
 impl Job {
@@ -305,7 +457,8 @@ impl Job {
                 (Outcome::Failed, None)
             }
             Ok((0, logs)) => {
-                if cacheable {
+                // A success after SIGTERM may be a task cutting its work short.
+                if cacheable && !self.groups.is_stopping() {
                     warnings.extend(self.cache(&target.outputs, logs, started).await);
                 }
                 (Outcome::Ran, Some(0))
@@ -412,16 +565,38 @@ impl Job {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
-        let group = Group::of(&child);
+        let group = self.groups.track(&child);
         let logs = capture.then(|| Mutex::new(Capture::new()));
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let (out, err) = tokio::join!(
-            self.pump(stdout, logs.as_ref(), false),
-            self.pump(stderr, logs.as_ref(), true)
-        );
-        out.and(err)?;
-        let status = child.wait().await?;
-        group.disarm();
+        let pumped = {
+            let mut pumps = pin!(async {
+                let (out, err) = tokio::join!(
+                    self.pump(stdout, logs.as_ref(), false),
+                    self.pump(stderr, logs.as_ref(), true)
+                );
+                out.and(err)
+            });
+            let drained = tokio::select! {
+                pumped = &mut pumps => Some(pumped),
+                exited = exited(&mut child) => {
+                    exited?;
+                    tokio::time::timeout(DRAIN, &mut pumps).await.ok()
+                }
+            };
+            match drained {
+                Some(pumped) => pumped,
+                // Processes the shell left behind hold the output open.
+                None => {
+                    group.kill();
+                    tokio::time::timeout(DRAIN, &mut pumps)
+                        .await
+                        .unwrap_or(Ok(()))
+                }
+            }
+        };
+        exited(&mut child).await?;
+        let status = group.reap(&mut child)?;
+        pumped?;
         let logs = logs.and_then(|logs| {
             logs.into_inner()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -522,31 +697,148 @@ fn exit_code(status: ExitStatus) -> i32 {
         .unwrap_or(-1)
 }
 
-/// A task's process group (on Unix), killed with everything in it if dropped armed, e.g.
-/// when the run is interrupted or dropped mid-task. Disarmed once the shell, the group
-/// leader, is reaped: until then its pid, which is the group id, can't be reused.
-#[cfg_attr(not(unix), allow(dead_code))]
-struct Group(Option<u32>);
+/// The process groups of running tasks, by id: the pid of the task's shell, its leader.
+/// A group is listed only until its shell is reaped, which happens under the lock, so a
+/// listed id can't have been reused.
+#[derive(Clone, Default)]
+struct Groups(Arc<Mutex<Live>>);
 
-impl Group {
-    fn of(child: &Child) -> Group {
-        Group(child.id())
+#[derive(Default)]
+struct Live {
+    pgids: BTreeSet<u32>,
+    /// Groups get SIGTERM, those listed now and any listed later.
+    stopping: bool,
+}
+
+impl Groups {
+    fn lock(&self) -> MutexGuard<'_, Live> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn disarm(mut self) {
-        self.0 = None;
+    fn track(&self, child: &Child) -> Group {
+        let pgid = child.id();
+        let mut live = self.lock();
+        if let Some(pgid) = pgid {
+            live.pgids.insert(pgid);
+            if live.stopping {
+                killpg(pgid, GroupSignal::Term);
+            }
+        }
+        Group {
+            groups: self.clone(),
+            pgid,
+        }
+    }
+
+    /// Sends every group SIGTERM, from now on.
+    fn stop(&self) {
+        let mut live = self.lock();
+        live.stopping = true;
+        live.pgids
+            .iter()
+            .for_each(|&pgid| killpg(pgid, GroupSignal::Term));
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.lock().stopping
+    }
+}
+
+/// A task's tracked process group, killed with everything in it if dropped before its
+/// shell is reaped, e.g. when the run is dropped or kills tasks that didn't stop.
+struct Group {
+    groups: Groups,
+    pgid: Option<u32>,
+}
+
+impl Group {
+    /// Kills what's left in the group; the shell must not have been reaped.
+    fn kill(&self) {
+        if let Some(pgid) = self.pgid {
+            killpg(pgid, GroupSignal::Kill);
+        }
+    }
+
+    /// Reaps the shell, which must have exited, untracking its group.
+    fn reap(mut self, child: &mut Child) -> io::Result<ExitStatus> {
+        let mut live = self.groups.lock();
+        if let Some(pgid) = self.pgid.take() {
+            live.pgids.remove(&pgid);
+        }
+        child
+            .try_wait()?
+            .ok_or_else(|| io::Error::other("the task's shell exited but wasn't reaped"))
     }
 }
 
 impl Drop for Group {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pgid) = self.0.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-            // SAFETY: killpg only sends a signal, to a group whose leader we haven't reaped.
-            unsafe {
-                libc::killpg(pgid, libc::SIGKILL);
-            }
+        if let Some(pgid) = self.pgid.take() {
+            let mut live = self.groups.lock();
+            live.pgids.remove(&pgid);
+            killpg(pgid, GroupSignal::Kill);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GroupSignal {
+    Term,
+    Kill,
+}
+
+/// Signals a tracked process group (a no-op off Unix). ESRCH, when no member is left, is
+/// harmless.
+fn killpg(pgid: u32, signal: GroupSignal) {
+    #[cfg(unix)]
+    if let Ok(pgid) = libc::pid_t::try_from(pgid) {
+        let signal = match signal {
+            GroupSignal::Term => libc::SIGTERM,
+            GroupSignal::Kill => libc::SIGKILL,
+        };
+        // SAFETY: killpg only sends a signal, to a group whose leader is unreaped.
+        unsafe { libc::killpg(pgid, signal) };
+    }
+    #[cfg(not(unix))]
+    let _ = (pgid, signal);
+}
+
+/// Waits for `child` to exit without reaping it, so its pid, the group id, stays reserved
+/// until [`Group::reap`].
+#[cfg(unix)]
+async fn exited(child: &mut Child) -> io::Result<()> {
+    let Some(pid) = child.id() else {
+        return Ok(());
+    };
+    let mut sigchld = signal(SignalKind::child()).ok();
+    while !has_exited(pid)? {
+        tokio::select! {
+            () = received(&mut sigchld) => {}
+            () = tokio::time::sleep(EXIT_POLL) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn exited(child: &mut Child) -> io::Result<()> {
+    child.wait().await.map(drop)
+}
+
+#[cfg(unix)]
+fn has_exited(pid: u32) -> io::Result<bool> {
+    // SAFETY: `siginfo_t` is plain data, for which all zeroes is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    // SAFETY: `info` is a valid, writable `siginfo_t`; WNOWAIT leaves the child waitable.
+    match unsafe { libc::waitid(libc::P_PID, pid, &mut info, options) } {
+        // SAFETY: waitid succeeded, so `info` is initialised; with WNOHANG `si_pid` stays
+        // 0 while the child runs.
+        0 => Ok(unsafe { info.si_pid() } != 0),
+        _ => match io::Error::last_os_error() {
+            e if e.kind() == io::ErrorKind::Interrupted => Ok(false),
+            e => Err(e),
+        },
     }
 }
 
@@ -598,6 +890,7 @@ mod tests {
                 result("d", Outcome::Skipped),
             ],
             warnings: vec![],
+            interrupted: false,
         };
         assert_eq!(
             report.summary(),
@@ -605,6 +898,151 @@ mod tests {
         );
         assert_eq!(report.exit_code(), 1);
         assert_eq!(RunReport::default().exit_code(), 0);
+    }
+
+    #[test]
+    fn summary_appends_stopped_tasks_which_dont_fail_the_run() {
+        let report = RunReport {
+            tasks: vec![result("a", Outcome::Ran), result("b", Outcome::Stopped)],
+            ..RunReport::default()
+        };
+        assert_eq!(
+            report.summary(),
+            "2 tasks: 1 ran, 0 cache hits, 0 failed, 0 skipped, 1 stopped"
+        );
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    /// A project whose persistent `dev` target runs `command`.
+    fn server(name: &str, command: &str) -> crate::graph::Project {
+        project(name, &[], &[("dev", &[])]).tap_mut(|p| {
+            let dev = p.targets.get_mut("dev").unwrap();
+            dev.persistent = true;
+            dev.command = command.into();
+        })
+    }
+
+    fn build(name: &str, command: &str) -> crate::graph::Project {
+        project(name, &[], &[("build", &[])])
+            .tap_mut(|p| p.targets.get_mut("build").unwrap().command = command.into())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fail_fast_stops_persistent_tasks() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = ws_at(
+            &root,
+            vec![server("srv", "sleep 30"), build("bad", "exit 3")],
+        );
+        let roots = vec![TaskId::new("srv", "dev"), TaskId::new("bad", "build")];
+        let graph = TaskGraph::from_roots(&ws, roots).unwrap();
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let report = tokio::time::timeout(
+            Duration::from_secs(3),
+            run(Arc::new(ws), &graph, &keys(&graph), store, &options(1)),
+        )
+        .await
+        .expect("fail-fast run hung behind a persistent task");
+        assert_eq!(
+            report.summary(),
+            "2 tasks: 0 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped"
+        );
+        assert_eq!(report.exit_code(), 1);
+        assert!(!report.interrupted);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_lets_persistent_tasks_shut_down_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let srv = server(
+            "srv",
+            "trap 'echo bye > ../t; exit 0' TERM; touch ../ready; sleep 60 & wait",
+        );
+        let bad = build(
+            "bad",
+            "while [ ! -f ../ready ]; do sleep 0.01; done; exit 3",
+        );
+        let ws = ws_at(&root, vec![srv, bad]);
+        let roots = vec![TaskId::new("srv", "dev"), TaskId::new("bad", "build")];
+        let graph = TaskGraph::from_roots(&ws, roots).unwrap();
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let started = Instant::now();
+        let report = run(Arc::new(ws), &graph, &keys(&graph), store, &options(1)).await;
+        assert!(started.elapsed() < GRACE, "{:?}", started.elapsed());
+        assert_eq!(std::fs::read_to_string(root.join("t")).unwrap(), "bye\n");
+        let srv = report
+            .tasks
+            .iter()
+            .find(|t| t.task.project == "srv")
+            .unwrap();
+        assert_eq!((srv.outcome, srv.exit_code), (Outcome::Stopped, Some(0)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_children_holding_the_output_dont_hold_up_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (ws, graph) = single(&root, "sleep 5 & echo $! > ../bg.pid; echo done");
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let started = Instant::now();
+        let report = run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.tasks[0].outcome, Outcome::Ran);
+        assert_eq!(stored(&store, &graph).unwrap().logs, [line(false, "done")]);
+        let bg = std::fs::read_to_string(root.join("bg.pid")).unwrap();
+        let bg = bg.trim().parse().unwrap();
+        let gone = async {
+            while is_alive(bg) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), gone)
+            .await
+            .expect("the background child was killed");
+    }
+
+    /// Signals the whole test process, so it would interrupt any run in parallel with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "sends SIGINT to the test process"]
+    async fn ctrl_c_stops_persistent_tasks_and_fails_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let srv = server(
+            "srv",
+            "trap 'echo bye > ../t; exit 0' TERM; touch ../ready; sleep 60 & wait",
+        );
+        let slow = build("slow", "sleep 60");
+        let ws = ws_at(&root, vec![srv, slow]);
+        let roots = vec![TaskId::new("srv", "dev"), TaskId::new("slow", "build")];
+        let graph = TaskGraph::from_roots(&ws, roots).unwrap();
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let ready = root.join("ready");
+        let interrupt = async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // SAFETY: `run` has installed its SIGINT handler, so this only notifies it.
+            unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        };
+        let (keys, opts) = (keys(&graph), options(2));
+        let (report, ()) = tokio::join!(run(Arc::new(ws), &graph, &keys, store, &opts), interrupt);
+        assert!(report.interrupted);
+        assert_eq!(
+            report.summary(),
+            "2 tasks: 0 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("t")).unwrap(), "bye\n");
     }
 
     #[cfg(unix)]
