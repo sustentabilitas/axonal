@@ -7,13 +7,15 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::graph::{Kind, Workspace};
+use crate::graph::{Kind, Project, Workspace};
 
 pub const PNPM_LOCK: &str = "pnpm-lock.yaml";
 pub const CARGO_LOCK: &str = "Cargo.lock";
 
-/// Resolved external packages per pnpm importer path or Cargo member name, transitively.
-pub type Closures = BTreeMap<String, BTreeSet<String>>;
+/// Resolved external packages per pnpm importer path or Cargo member name, transitively,
+/// each with a fingerprint of how it resolves (pnpm's `packages` entry, Cargo's checksum),
+/// so a package re-resolved under the same key still counts as changed.
+pub type Closures = BTreeMap<String, BTreeMap<String, String>>;
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +23,8 @@ struct PnpmLock {
     lockfile_version: Option<String>,
     #[serde(default)]
     importers: BTreeMap<String, Importer>,
+    #[serde(default)]
+    packages: BTreeMap<String, serde_norway::Value>,
     #[serde(default)]
     snapshots: BTreeMap<String, Snapshot>,
 }
@@ -69,6 +73,7 @@ struct Snapshot {
 /// pnpm 9+ lockfiles, including the multi-document files pnpm 11+ writes.
 pub fn pnpm_closures(text: &str) -> Result<Closures, String> {
     let mut importers: BTreeMap<String, Importer> = BTreeMap::new();
+    let mut packages: BTreeMap<String, serde_norway::Value> = BTreeMap::new();
     let mut snapshots: BTreeMap<String, Snapshot> = BTreeMap::new();
     for doc in serde_norway::Deserializer::from_str(text) {
         let lock = PnpmLock::deserialize(doc).map_err(|e| e.to_string())?;
@@ -86,8 +91,16 @@ pub fn pnpm_closures(text: &str) -> Result<Closures, String> {
         for (path, importer) in lock.importers {
             importers.entry(path).or_default().merge(importer);
         }
+        packages.extend(lock.packages);
         snapshots.extend(lock.snapshots);
     }
+    let fingerprint = |key: &str| {
+        let base = key.split('(').next().unwrap_or(key);
+        packages
+            .get(base)
+            .map(|entry| serde_json::to_string(entry).unwrap_or_default())
+            .unwrap_or_default()
+    };
     Ok(importers
         .into_iter()
         .map(|(path, importer)| {
@@ -95,7 +108,14 @@ pub fn pnpm_closures(text: &str) -> Result<Closures, String> {
                 .all()
                 .filter_map(|(name, r)| package_key(name, &r.version))
                 .collect();
-            (path, closure(roots, &snapshots))
+            let resolved = closure(roots, &snapshots)
+                .into_iter()
+                .map(|key| {
+                    let print = fingerprint(&key);
+                    (key, print)
+                })
+                .collect();
+            (path, resolved)
         })
         .collect())
 }
@@ -145,6 +165,7 @@ struct LockPackage {
     name: String,
     version: String,
     source: Option<String>,
+    checksum: Option<String>,
     #[serde(default)]
     dependencies: Vec<String>,
 }
@@ -162,7 +183,7 @@ pub fn cargo_closures(text: &str) -> Result<Closures, String> {
         .filter(|p| p.source.is_none())
         .map(|member| {
             let mut seen: BTreeSet<*const LockPackage> = BTreeSet::new();
-            let mut externals = BTreeSet::new();
+            let mut externals = BTreeMap::new();
             let mut stack = vec![member];
             while let Some(package) = stack.pop() {
                 for dep in package
@@ -172,7 +193,10 @@ pub fn cargo_closures(text: &str) -> Result<Closures, String> {
                 {
                     if seen.insert(std::ptr::from_ref(dep)) {
                         if let Some(source) = &dep.source {
-                            externals.insert(format!("{} {} {source}", dep.name, dep.version));
+                            externals.insert(
+                                format!("{} {} {source}", dep.name, dep.version),
+                                dep.checksum.clone().unwrap_or_default(),
+                            );
                         }
                         stack.push(dep);
                     }
@@ -238,7 +262,8 @@ fn importer(root: &Path) -> String {
 /// Projects whose external dependencies changed. Each argument is `None` when that lockfile
 /// did not change, else its (old, new) contents (`None` where absent). A lockfile that
 /// fails to parse, or a change to the root pnpm importer, impacts every project of its
-/// ecosystem.
+/// ecosystem. Explicit projects outside the ecosystem's inference (no importer, no crate)
+/// may run anything, so any resolved change impacts them.
 pub fn impacted(
     ws: &Workspace,
     pnpm: Option<(Option<&str>, Option<&str>)>,
@@ -246,30 +271,43 @@ pub fn impacted(
 ) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     if let Some((old, new)) = pnpm {
-        let js = ws
-            .projects
-            .values()
-            .filter(|p| p.kinds.contains(&Kind::Js) || p.kinds.contains(&Kind::Explicit));
-        match diff(old, new, pnpm_closures) {
-            Some(changed) if !changed.contains(".") => out.extend(
-                js.filter(|p| p.kinds.contains(&Kind::Js) && changed.contains(&importer(&p.root)))
-                    .map(|p| p.name.clone()),
-            ),
-            _ => out.extend(js.map(|p| p.name.clone())),
-        }
+        let changed = diff(old, new, pnpm_closures).filter(|changed| !changed.contains("."));
+        out.extend(impact(ws, changed, Kind::Js, |p, changed| {
+            changed.contains(&importer(&p.root))
+        }));
     }
     if let Some((old, new)) = cargo {
-        let crates = ws.projects.values().filter(|p| p.crate_name.is_some());
-        match diff(old, new, cargo_closures) {
-            Some(changed) => out.extend(
-                crates
-                    .filter(|p| p.crate_name.as_ref().is_some_and(|c| changed.contains(c)))
-                    .map(|p| p.name.clone()),
-            ),
-            None => out.extend(crates.map(|p| p.name.clone())),
-        }
+        out.extend(impact(
+            ws,
+            diff(old, new, cargo_closures),
+            Kind::Cargo,
+            |p, changed| p.crate_name.as_ref().is_some_and(|c| changed.contains(c)),
+        ));
     }
     out
+}
+
+/// `changed` is `None` when everything of the ecosystem counts as changed.
+fn impact(
+    ws: &Workspace,
+    changed: Option<BTreeSet<String>>,
+    kind: Kind,
+    precise: impl Fn(&Project, &BTreeSet<String>) -> bool,
+) -> Vec<String> {
+    let inferred = |p: &Project| match kind {
+        Kind::Cargo => p.crate_name.is_some(),
+        _ => p.kinds.contains(&kind),
+    };
+    ws.projects
+        .values()
+        .filter(|p| match &changed {
+            _ if !inferred(p) && !p.kinds.contains(&Kind::Explicit) => false,
+            None => true,
+            Some(changed) if inferred(p) => precise(p, changed),
+            Some(changed) => !changed.is_empty(),
+        })
+        .map(|p| p.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -346,6 +384,10 @@ dependencies = [
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    fn keys(resolved: &BTreeMap<String, String>) -> BTreeSet<String> {
+        resolved.keys().cloned().collect()
+    }
+
     fn mixed() -> Workspace {
         let mut app = project("@mixed/app", &["@mixed/ui"], &[]);
         app.root = "packages/app".into();
@@ -365,8 +407,11 @@ dependencies = [
     #[test]
     fn pnpm_closures_follow_snapshots_and_skip_links() {
         let c = pnpm_closures(PNPM).unwrap();
-        assert_eq!(c["packages/app"], set(&["is-number@6.0.0", "is-odd@3.0.1"]));
-        assert_eq!(c["packages/ui"], set(&["left-pad@1.3.0"]));
+        assert_eq!(
+            keys(&c["packages/app"]),
+            set(&["is-number@6.0.0", "is-odd@3.0.1"])
+        );
+        assert_eq!(keys(&c["packages/ui"]), set(&["left-pad@1.3.0"]));
         assert!(c["."].is_empty());
     }
 
@@ -398,7 +443,7 @@ snapshots:
   lodash-es@4.17.21: {}
 ";
         assert_eq!(
-            pnpm_closures(text).unwrap()["web"],
+            keys(&pnpm_closures(text).unwrap()["web"]),
             set(&[
                 "lodash-es@4.17.21",
                 "react-dom@19.0.0(react@19.0.0)",
@@ -416,8 +461,8 @@ snapshots:
     fn cargo_closures_are_transitive_and_external_only() {
         let c = cargo_closures(CARGO).unwrap();
         let itoa = "itoa 1.0.15 registry+https://github.com/rust-lang/crates.io-index";
-        assert_eq!(c["engine"], set(&[itoa]));
-        assert_eq!(c["server"], set(&[itoa]));
+        assert_eq!(keys(&c["engine"]), set(&[itoa]));
+        assert_eq!(keys(&c["server"]), set(&[itoa]));
     }
 
     #[test]
@@ -442,7 +487,7 @@ version = "1.0.15"
 source = "git+https://example.com/itoa#abc"
 "#;
         assert_eq!(
-            cargo_closures(text).unwrap()["app"],
+            keys(&cargo_closures(text).unwrap()["app"]),
             set(&["itoa 1.0.15 git+https://example.com/itoa#abc"])
         );
     }
@@ -499,6 +544,44 @@ source = "git+https://example.com/itoa#abc"
             impacted(&ws, None, Some((Some(CARGO), Some("not toml [")))),
             set(&["engine", "server"])
         );
+    }
+
+    #[test]
+    fn re_resolved_packages_under_the_same_key_impact_their_users() {
+        let ws = mixed();
+        let repacked = PNPM.replace("sha512-x", "sha512-x2");
+        assert_eq!(
+            impacted(&ws, Some((Some(PNPM), Some(&repacked))), None),
+            set(&["@mixed/app"])
+        );
+        let with_sum = |sum: &str| {
+            CARGO.replace(
+                "crates.io-index\"\n",
+                &format!("crates.io-index\"\nchecksum = \"{sum}\"\n"),
+            )
+        };
+        assert_eq!(
+            impacted(
+                &ws,
+                None,
+                Some((Some(&with_sum("aa")), Some(&with_sum("bb"))))
+            ),
+            set(&["engine", "server"])
+        );
+    }
+
+    #[test]
+    fn explicit_projects_see_any_resolved_change() {
+        let mut ws = mixed();
+        let tools = project("tools", &[], &[]);
+        ws.projects.insert(tools.name.clone(), tools);
+        let cargo_bumped = CARGO.replace("1.0.15", "1.0.16");
+        assert!(impacted(&ws, None, Some((Some(CARGO), Some(&cargo_bumped)))).contains("tools"));
+        assert!(impacted(&ws, None, Some((Some(CARGO), Some("not toml [")))).contains("tools"));
+        let bumped = PNPM.replace("left-pad@1.3.0", "left-pad@1.3.1");
+        assert!(impacted(&ws, Some((Some(PNPM), Some(&bumped))), None).contains("tools"));
+        let comment = format!("{CARGO}# comment\n");
+        assert!(impacted(&ws, None, Some((Some(CARGO), Some(&comment)))).is_empty());
     }
 
     #[test]
