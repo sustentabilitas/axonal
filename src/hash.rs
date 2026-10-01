@@ -2236,7 +2236,11 @@ inputs = ["src/**"]
                     writeln!(
                         config,
                         "[projects.p{i:02}.targets.{t}]\ncommand = \"{t} {i}\"\n{}",
-                        if narrow { "inputs = [\"src/**\"]\n" } else { "" }
+                        if narrow {
+                            "inputs = [\"src/**\"]\n"
+                        } else {
+                            ""
+                        }
                     )
                     .unwrap();
                 }

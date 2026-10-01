@@ -98,7 +98,7 @@ pub fn pnpm_closures(text: &str) -> Result<Closures, String> {
         let base = key.split('(').next().unwrap_or(key);
         packages
             .get(base)
-            .map(|entry| serde_json::to_string(entry).unwrap_or_default())
+            .map(|entry| serde_json::to_string(entry).unwrap_or_else(|_| format!("{entry:?}")))
             .unwrap_or_default()
     };
     Ok(importers

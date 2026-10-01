@@ -82,17 +82,21 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<String> {
     }
 }
 
-/// `merge-base(<branch>, head)`, falling back to `origin/<branch>`.
+/// `merge-base(<branch>, head)`, falling back to `origin/<branch>` when the local branch is
+/// missing or shares no history with `head` (a stale branch in a shallow CI checkout).
 pub fn default_base(dir: &Path, branch: &str, head: &str) -> Result<String> {
     [branch.to_string(), format!("origin/{branch}")]
         .iter()
-        .find(|b| rev_exists(dir, b))
-        .ok_or_else(|| {
-            Error::Git(format!(
-                "cannot find `{branch}` or `origin/{branch}`; pass --base"
-            ))
+        .filter(|b| rev_exists(dir, b))
+        .fold(None, |found: Option<Result<String>>, b| match found {
+            Some(Ok(base)) => Some(Ok(base)),
+            _ => Some(merge_base(dir, b, head)),
         })
-        .and_then(|b| merge_base(dir, b, head))
+        .unwrap_or_else(|| {
+            Err(Error::Git(format!(
+                "cannot find `{branch}` or `origin/{branch}`; pass --base"
+            )))
+        })
 }
 
 /// Files changed between `base` and `head`; with no `head`, against the working tree,
@@ -292,6 +296,12 @@ mod tests {
         fs::write(clone.join("ws/a.txt"), "two").unwrap();
         commit(&clone, "change");
         assert_eq!(default_branch(&clone).as_deref(), Some("main"));
+        assert_eq!(default_base(&clone, "main", "HEAD").unwrap(), main);
+
+        sh(&clone, &["checkout", "-q", "--orphan", "stale"]);
+        commit(&clone, "unrelated");
+        sh(&clone, &["branch", "-q", "main"]);
+        sh(&clone, &["checkout", "-q", "feature"]);
         assert_eq!(default_base(&clone, "main", "HEAD").unwrap(), main);
     }
 
