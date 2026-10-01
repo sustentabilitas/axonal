@@ -66,7 +66,7 @@ pub enum Outcome {
     Failed,
     /// Not run because a dependency failed, or fail-fast or an interrupt stopped scheduling.
     Skipped,
-    /// A persistent task axonal stopped, on fail-fast or an interrupt.
+    /// A persistent task axonal stopped, after a failure or on an interrupt.
     Stopped,
 }
 
@@ -125,8 +125,8 @@ pub fn default_parallelism() -> usize {
 /// get a null stdin.
 ///
 /// Persistent tasks are never cached and take no slot, so servers that never exit can't
-/// starve the tasks around them; the run ends only once they exit. After a failure without
-/// `keep_going`, they're stopped as soon as nothing else is running.
+/// starve the tasks around them; the run ends only once they exit. After a failure, even
+/// with `keep_going`, they're stopped as soon as no other task is running or can start.
 ///
 /// On Unix each task runs in its own process group. Stopping tasks sends their groups
 /// SIGTERM and gives them [`GRACE`] to exit before killing them; a task whose shell exits
@@ -152,7 +152,7 @@ pub async fn run(
     let mut deadline = None;
     loop {
         s.schedule();
-        if deadline.is_none() && s.stopped && s.busy == 0 && !s.running.is_empty() {
+        if deadline.is_none() && s.failed && s.busy == 0 && !s.running.is_empty() {
             deadline = Some(s.stop());
         }
         tokio::select! {
@@ -192,6 +192,7 @@ struct Scheduler<'a> {
     warnings: Vec<String>,
     /// No more tasks are started, after a failure without `keep_going` or an interrupt.
     stopped: bool,
+    failed: bool,
     groups: Groups,
 }
 
@@ -222,6 +223,7 @@ impl<'a> Scheduler<'a> {
             results: BTreeMap::new(),
             warnings: Vec::new(),
             stopped: false,
+            failed: false,
             groups: Groups::default(),
         }
     }
@@ -290,7 +292,10 @@ impl<'a> Scheduler<'a> {
         }
         self.warnings.extend(warnings);
         match result.outcome {
-            Outcome::Failed => self.stopped |= !self.opts.keep_going,
+            Outcome::Failed => {
+                self.failed = true;
+                self.stopped |= !self.opts.keep_going;
+            }
             Outcome::Ran | Outcome::CacheHit => {
                 for dependent in self.dependents.get(&result.task).into_iter().flatten() {
                     if let Some(n) = self.waiting.get_mut(dependent) {
@@ -985,6 +990,44 @@ mod tests {
             "2 tasks: 0 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped"
         );
         assert_eq!(report.exit_code(), 1);
+        assert!(!report.interrupted);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keep_going_stops_persistent_tasks_once_the_rest_are_done_after_a_failure() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = ws_at(
+            &root,
+            vec![
+                server("srv", "sleep 30"),
+                build("bad", "exit 3"),
+                build("good", "true"),
+            ],
+        );
+        let roots = vec![
+            TaskId::new("srv", "dev"),
+            TaskId::new("bad", "build"),
+            TaskId::new("good", "build"),
+        ];
+        let graph = TaskGraph::from_roots(&ws, roots).unwrap();
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let opts = RunOptions {
+            keep_going: true,
+            ..options(1)
+        };
+        let report = tokio::time::timeout(
+            Duration::from_secs(3),
+            run(Arc::new(ws), &graph, &keys(&graph), store, &opts),
+        )
+        .await
+        .expect("the run hung behind a persistent task");
+        assert_eq!(
+            report.summary(),
+            "3 tasks: 1 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped"
+        );
         assert!(!report.interrupted);
     }
 
