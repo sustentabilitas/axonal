@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MPL-2.0"
-description = "A fast, simple monorepo task runner for pnpm and Cargo workspaces"
+description = "Experimental: a fast, simple monorepo task runner for pnpm and Cargo workspaces"
 repository = "https://github.com/sustentabilitas/axonal"
 readme = "README.md"
 keywords = ["monorepo", "build", "cache", "pnpm", "cargo"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
+
+[[bin]]
+name = "ax"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
