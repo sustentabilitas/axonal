@@ -129,14 +129,15 @@ pub fn default_parallelism() -> usize {
 ///
 /// Persistent tasks are never cached and take no slot, so servers that never exit can't
 /// starve the tasks around them; the run ends only once they exit. After a failure, even
-/// with `keep_going`, they're stopped as soon as no other task is running or can start.
+/// with `keep_going`, none start, and running ones are stopped as soon as no other task is
+/// running or can start.
 ///
 /// On Unix each task runs in its own process group. Stopping tasks sends their groups
 /// SIGTERM and gives them [`GRACE`] to exit before killing them; a task whose shell exits
 /// while processes it left behind still hold its output has them killed after [`DRAIN`].
 /// Ctrl-C (and SIGTERM, SIGHUP and SIGQUIT on Unix) stops every running task: persistent
-/// ones are `Stopped`, the rest `Failed`, the unstarted `Skipped`, and a second Ctrl-C
-/// kills at once. The signal handlers are installed when `run` is called and stay
+/// ones are `Stopped`, the rest `Failed`, the unstarted `Skipped`, and a second Ctrl-C or
+/// SIGQUIT kills at once (a repeated SIGTERM or SIGHUP doesn't cut the grace short). The signal handlers are installed when `run` is called and stay
 /// installed after it returns. Dropping the future kills every running task's group.
 ///
 /// # Panics
@@ -163,10 +164,12 @@ pub async fn run(
                 Some(joined) => s.finish(joined),
                 None => break,
             },
-            () = interrupts.recv() => {
+            forceful = interrupts.recv() => {
                 interrupted = true;
-                if deadline.is_some() {
-                    break;
+                match (deadline, forceful) {
+                    (Some(_), true) => break,
+                    (Some(_), false) => continue,
+                    (None, _) => {}
                 }
                 s.warnings.push("interrupted: stopping running tasks".into());
                 deadline = Some(s.stop());
@@ -241,6 +244,13 @@ impl<'a> Scheduler<'a> {
             .into_iter()
             .partition(|id| is_persistent(ws, id));
         self.ready = rest;
+        // After a failure a persistent task would only be stopped once the rest finish, and
+        // its startup (migrations, ports) shouldn't happen for that; unstarted, it's Skipped.
+        let persistent = if self.failed {
+            VecDeque::new()
+        } else {
+            persistent
+        };
         let free = (self.opts.parallel.max(1))
             .saturating_sub(self.busy)
             .min(self.ready.len());
@@ -410,21 +420,26 @@ impl Interrupts {
         }
     }
 
-    /// The next interrupt; never, if no handler could be installed.
-    async fn recv(&mut self) {
+    /// The next interrupt, and whether repeating it means "kill now" (Ctrl-C, SIGQUIT)
+    /// rather than arriving twice by itself (SIGTERM, and the SIGHUP that both the shell
+    /// and the kernel send when a terminal closes); never, if no handler could be installed.
+    async fn recv(&mut self) -> bool {
         #[cfg(unix)]
         {
             let [int, term, hup, quit] = &mut self.signals;
             tokio::select! {
-                () = received(int) => {}
-                () = received(term) => {}
-                () = received(hup) => {}
-                () = received(quit) => {}
+                () = received(int) => true,
+                () = received(term) => false,
+                () = received(hup) => false,
+                () = received(quit) => true,
             }
         }
         #[cfg(not(unix))]
-        if tokio::signal::ctrl_c().await.is_err() {
-            pending().await
+        {
+            if tokio::signal::ctrl_c().await.is_err() {
+                pending::<()>().await
+            }
+            true
         }
     }
 }
@@ -1036,6 +1051,43 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn keep_going_never_starts_persistent_tasks_readied_after_a_failure() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let srv = project("srv", &["good"], &[("dev", &["^build"])]).tap_mut(|p| {
+            let dev = p.targets.get_mut("dev").unwrap();
+            dev.persistent = true;
+            dev.command = "touch ../srv.started; sleep 30".into();
+        });
+        let good = build(
+            "good",
+            "while [ ! -e ../bad.done ]; do sleep 0.01; done; sleep 0.3",
+        );
+        let bad = build("bad", "touch ../bad.done; exit 3");
+        let ws = ws_at(&root, vec![srv, good, bad]);
+        let roots = vec![TaskId::new("srv", "dev"), TaskId::new("bad", "build")];
+        let graph = TaskGraph::from_roots(&ws, roots).unwrap();
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let opts = RunOptions {
+            keep_going: true,
+            ..options(2)
+        };
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            run(Arc::new(ws), &graph, &keys(&graph), store, &opts),
+        )
+        .await
+        .expect("the run hung behind a persistent task");
+        assert_eq!(
+            report.summary(),
+            "3 tasks: 1 ran, 0 cache hits, 1 failed, 1 skipped"
+        );
+        assert!(!root.join("srv.started").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn tasks_ignoring_sigterm_are_killed_after_the_grace_with_their_children() {
         use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
@@ -1223,10 +1275,13 @@ mod tests {
         let gone = within(Duration::from_secs(5), || {
             !groups.iter().any(|&g| group_exists(g))
         });
-        groups.iter().for_each(|&g| {
-            // SAFETY: only signals the groups of the tasks this test started.
-            unsafe { libc::killpg(g, libc::SIGKILL) };
-        });
+        if !gone {
+            groups.iter().for_each(|&g| {
+                // SAFETY: only signals the groups of the tasks this test started, which
+                // still exist, so their ids can't have been reused.
+                unsafe { libc::killpg(g, libc::SIGKILL) };
+            });
+        }
         let _ = child.kill();
         let output = child.wait_with_output().unwrap();
         let log = format!(
