@@ -33,6 +33,11 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "output path {} is a symlink above the outputs, so they cannot be cached or restored",
+        path.display()
+    )]
+    SymlinkedOutputPath { path: PathBuf },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

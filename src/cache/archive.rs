@@ -747,6 +747,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_symlinked_glob_base_reported_by_existing_files_is_replaced() {
+        let (_src, packed, meta) = packed(&[("libs/a/dist/out.txt", "built")]);
+        let (outer, ws) = workspace();
+        touch(outer.path(), "elsewhere/keep.txt", "keep");
+        touch(&ws, "libs/a/package.json", "{}");
+        std::os::unix::fs::symlink(outer.path().join("elsewhere"), ws.join("libs/a/dist")).unwrap();
+        let stale = crate::files::Patterns::new(&["dist/**".into()])
+            .unwrap()
+            .existing_files(&ws, Path::new("libs/a"))
+            .unwrap();
+        assert_eq!(stale, paths(&["libs/a/dist"]));
+
+        restore(&ws, &meta, File::open(packed.path()).unwrap(), &stale).unwrap();
+        assert!(
+            !fs::symlink_metadata(ws.join("libs/a/dist"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(ws.join("libs/a/dist/out.txt")).unwrap(),
+            "built"
+        );
+        assert!(ws.join("libs/a/package.json").is_file());
+        assert_eq!(
+            fs::read_to_string(outer.path().join("elsewhere/keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stale_files_behind_symlinked_directories_are_left_alone() {
         let (_src, packed, meta) = packed(&[("out.txt", "built")]);
         let (outer, ws) = workspace();

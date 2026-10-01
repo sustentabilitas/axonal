@@ -168,10 +168,13 @@ impl Patterns {
     /// Existing non-directories matching these globs, found by walking each glob's literal
     /// base without gitignore filtering (outputs are usually ignored) and skipping `.git`,
     /// `.axonal` and `node_modules` below it. Symlinks are reported, never followed: a
-    /// matching link is a leaf, and a symlink on the path to the glob base, the project
-    /// root included, is reported whether or not it matches, since everything the glob
-    /// could match lies behind it.
+    /// matching link is a leaf, and a symlinked glob base is reported whether or not it
+    /// matches, since everything the glob could match lies behind it.
     /// Workspace-relative and sorted.
+    ///
+    /// Fails with [`Error::SymlinkedOutputPath`] naming the first symlink on the project
+    /// root's path (the root included) or on a proper ancestor of a glob base: restoring
+    /// would replace that link and hide everything else behind it.
     pub fn existing_files(&self, root: &Path, project_root: &Path) -> Result<Vec<PathBuf>> {
         [
             (&self.project_globs, &self.project, project_root),
@@ -199,21 +202,27 @@ struct Walk<'a> {
 impl Walk<'_> {
     /// Descends from the workspace root through `base` and `glob_base` one component at a
     /// time, stopping at the first missing path or symlink, then walks what it reached.
+    /// A symlinked glob base is reported; a symlink above it is an error.
     fn start(&self, glob_base: &Path, found: &mut BTreeSet<PathBuf>) -> Result<()> {
+        let depth = self.base.components().count() + glob_base.components().count();
+        let is_glob_base = |n: usize| n == depth && glob_base.components().next().is_some();
         let mut rel = PathBuf::new();
         let mut parts = self
             .base
             .components()
             .chain(glob_base.components())
+            .zip(1..)
             .peekable();
-        while let Some(part) = parts.next() {
+        while let Some((part, n)) = parts.next() {
             rel.push(part);
             let Some(meta) = symlink_metadata(&self.root.join(&rel))? else {
                 return Ok(());
             };
             if meta.is_symlink() {
-                found.insert(rel);
-                return Ok(());
+                return is_glob_base(n)
+                    .then(|| found.insert(rel.clone()))
+                    .map(|_| ())
+                    .ok_or(Error::SymlinkedOutputPath { path: rel });
             }
             if !meta.is_dir() {
                 if parts.peek().is_none() {
@@ -499,7 +508,7 @@ mod tests {
         touch(dir.path(), "elsewhere/out/x.js");
         fs::create_dir_all(dir.path().join("libs/a")).unwrap();
         symlink(dir.path().join("elsewhere"), dir.path().join("libs/a/dist")).unwrap();
-        for glob in ["dist/**", "dist/out/**/*.js"] {
+        for glob in ["dist/**", "dist", "{workspace}/libs/a/dist/**"] {
             let p = Patterns::new(&[glob.into()]).unwrap();
             assert_eq!(
                 p.existing_files(dir.path(), Path::new("libs/a")).unwrap(),
@@ -509,25 +518,91 @@ mod tests {
         }
     }
 
+    /// `link` → `target`, both workspace-relative, with `target/<sibling>` present.
+    #[cfg(unix)]
+    fn linked(root: &Path, link: &str, target: &str, siblings: &[&str]) {
+        siblings
+            .iter()
+            .for_each(|s| touch(root, &format!("{target}/{s}")));
+        let link = root.join(link);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(root.join(target), link).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_symlinked_output_path(
+        root: &Path,
+        project: &str,
+        globs: &[&str],
+        link: &str,
+        siblings: &[&str],
+    ) {
+        for glob in globs {
+            let p = Patterns::new(&[glob.to_string()]).unwrap();
+            let err = p.existing_files(root, Path::new(project));
+            assert!(
+                matches!(&err, Err(Error::SymlinkedOutputPath { path }) if path == Path::new(link)),
+                "{project} {glob}: {err:?}"
+            );
+        }
+        assert!(fs::symlink_metadata(root.join(link)).unwrap().is_symlink());
+        for sibling in siblings {
+            assert!(root.join(link).join(sibling).is_file(), "{sibling}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn existing_files_never_follow_a_symlinked_project_root() {
-        use std::os::unix::fs::symlink;
+    fn a_symlinked_ancestor_of_the_project_root_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        touch(dir.path(), "elsewhere/a/dist/x.js");
-        fs::create_dir_all(dir.path().join("libs")).unwrap();
-        symlink(dir.path().join("elsewhere/a"), dir.path().join("libs/a")).unwrap();
-        symlink(dir.path().join("elsewhere"), dir.path().join("linked")).unwrap();
-        for (project, expected) in [("libs/a", "libs/a"), ("linked/a", "linked")] {
-            for glob in ["dist/**", "**/*"] {
-                let p = Patterns::new(&[glob.into()]).unwrap();
-                assert_eq!(
-                    p.existing_files(dir.path(), Path::new(project)).unwrap(),
-                    paths(&[expected]),
-                    "{project} {glob}"
-                );
-            }
-        }
+        let siblings = ["other/package.json", "web/src/main.ts"];
+        linked(dir.path(), "apps", "elsewhere/apps", &siblings);
+        assert_symlinked_output_path(
+            dir.path(),
+            "apps/web",
+            &["dist/**", "**/*"],
+            "apps",
+            &siblings,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_root_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let siblings = ["Cargo.toml", "src/lib.rs"];
+        linked(dir.path(), "crates/a", "vendor/a", &siblings);
+        assert_symlinked_output_path(
+            dir.path(),
+            "crates/a",
+            &["target/**", "**/*"],
+            "crates/a",
+            &siblings,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ancestor_of_a_glob_base_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let siblings = ["dist/x.js", "src/y.ts"];
+        linked(dir.path(), "shared", "elsewhere/shared", &siblings);
+        assert_symlinked_output_path(
+            dir.path(),
+            "apps/web",
+            &["{workspace}/shared/dist/**", "{workspace}/shared/dist/x.js"],
+            "shared",
+            &siblings,
+        );
+        touch(dir.path(), "libs/a/package.json");
+        linked(dir.path(), "libs/a/dist", "elsewhere/dist", &["out/x.js"]);
+        assert_symlinked_output_path(
+            dir.path(),
+            "libs/a",
+            &["dist/out/**/*.js"],
+            "libs/a/dist",
+            &["out/x.js"],
+        );
     }
 
     #[test]
