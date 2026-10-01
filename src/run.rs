@@ -31,7 +31,7 @@ use crate::{
 };
 
 /// Longest line printed or captured whole; longer ones are split into lines this long.
-const MAX_LINE: u64 = 64 << 10;
+const MAX_LINE: usize = 64 << 10;
 /// Most bytes of output captured for the cache; a task printing more isn't cached.
 #[cfg(not(test))]
 const MAX_LOGS: usize = 8 << 20;
@@ -618,7 +618,8 @@ impl Job {
         Ok((exit_code(status), logs))
     }
 
-    /// Prints and captures `stream` line by line, splitting lines at [`MAX_LINE`] bytes.
+    /// Prints and captures `stream` line by line, splitting lines at [`MAX_LINE`] bytes,
+    /// between UTF-8 characters where there are any.
     async fn pump(
         &self,
         stream: Option<impl AsyncRead + Unpin>,
@@ -629,24 +630,35 @@ impl Job {
             return Ok(());
         };
         let mut reader = BufReader::new(stream);
+        // Starts with the bytes of a character the last chunk would have split.
         let mut buf = Vec::new();
-        while (&mut reader)
-            .take(MAX_LINE)
-            .read_until(b'\n', &mut buf)
-            .await?
-            > 0
-        {
-            let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            self.emit(line, stderr);
-            if let Some(logs) = logs {
-                logs.lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(stderr, line);
+        // The newline ending a split line may come alone, ending nothing more.
+        let mut split = false;
+        loop {
+            let room = (MAX_LINE - buf.len()) as u64;
+            let read = (&mut reader).take(room).read_until(b'\n', &mut buf).await?;
+            if read == 0 && buf.is_empty() {
+                return Ok(());
             }
-            buf.clear();
+            let ended = buf.ends_with(b"\n");
+            let end = if buf.len() == MAX_LINE && !ended {
+                char_boundary(&buf)
+            } else {
+                buf.len()
+            };
+            let line = buf[..end].strip_suffix(b"\n").unwrap_or(&buf[..end]);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if !(split && ended && line.is_empty()) {
+                self.emit(line, stderr);
+                if let Some(logs) = logs {
+                    logs.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(stderr, line);
+                }
+            }
+            split = !ended;
+            buf.drain(..end);
         }
-        Ok(())
     }
 
     /// Writes `line` as is, prefixed with the task.
@@ -658,6 +670,15 @@ impl Job {
             io::stdout().lock().write_all(&text)
         };
     }
+}
+
+/// The length of `chunk` without the UTF-8 character it cuts short at its end, if any.
+fn char_boundary(chunk: &[u8]) -> usize {
+    (chunk.len().saturating_sub(3)..chunk.len())
+        .rev()
+        .find(|&i| chunk[i] & 0xC0 != 0x80)
+        .filter(|&i| std::str::from_utf8(&chunk[i..]).is_err_and(|e| e.error_len().is_none()))
+        .unwrap_or(chunk.len())
 }
 
 /// Output lines captured for the cache, abandoned past [`MAX_LOGS`] bytes, counting each
@@ -1328,12 +1349,53 @@ mod tests {
         let report = run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
         assert_eq!(report.tasks[0].outcome, Outcome::Ran);
         let logs = stored(&store, &graph).unwrap().logs;
-        assert_eq!(logs.len(), 1_000_000_usize.div_ceil(MAX_LINE as usize));
-        assert!(
-            logs.iter()
-                .all(|l| !l.stderr && l.text.len() <= MAX_LINE as usize)
-        );
+        assert_eq!(logs.len(), 1_000_000_usize.div_ceil(MAX_LINE));
+        assert!(logs.iter().all(|l| !l.stderr && l.text.len() <= MAX_LINE));
         assert_eq!(logs.iter().map(|l| l.text.len()).sum::<usize>(), 1_000_000);
+    }
+
+    #[test]
+    fn char_boundary_drops_only_a_character_cut_short() {
+        let (euro, smile) = ("€".as_bytes(), "😀".as_bytes());
+        assert_eq!(char_boundary(b"ab"), 2);
+        assert_eq!(char_boundary(&[b"a", &euro[..2]].concat()), 1);
+        assert_eq!(char_boundary(&[b"a", euro].concat()), 4);
+        assert_eq!(char_boundary(&[b"a", &smile[..3]].concat()), 1);
+        assert_eq!(char_boundary(b"a\x80\x80\x80"), 4);
+        assert_eq!(char_boundary(b"a\xff"), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_line_of_exactly_the_limit_stays_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let command = format!("head -c {MAX_LINE} /dev/zero | tr '\\0' a; echo; echo next");
+        let (ws, graph) = single(&root, &command);
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
+        assert_eq!(
+            stored(&store, &graph).unwrap().logs,
+            [line(false, &"a".repeat(MAX_LINE)), line(false, "next")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_lines_are_split_between_utf8_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let command = format!(
+            "head -c {} /dev/zero | tr '\\0' a; printf '\\303\\251\\n'",
+            MAX_LINE - 1
+        );
+        let (ws, graph) = single(&root, &command);
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
+        assert_eq!(
+            stored(&store, &graph).unwrap().logs,
+            [line(false, &"a".repeat(MAX_LINE - 1)), line(false, "é")]
+        );
     }
 
     #[cfg(unix)]
