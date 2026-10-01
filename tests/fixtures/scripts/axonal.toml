@@ -1,0 +1,23 @@
+[targets.build]
+depends_on = ["^build"]
+inputs = ["src/**"]
+outputs = ["dist/**"]
+
+[projects."libs/a".targets.build]
+command = "mkdir -p dist && cat src/a.txt > dist/out.txt && echo built a"
+
+[projects."apps/b"]
+deps = ["libs/a"]
+
+[projects."apps/b".targets.build]
+command = "mkdir -p dist && cat src/b.txt ../../libs/a/dist/out.txt > dist/out.txt && echo built b"
+
+[projects."apps/b".targets.fail]
+command = "echo about to fail && exit 3"
+
+[projects."apps/b".targets.deploy]
+command = "echo deploying"
+depends_on = ["fail"]
+
+[projects."apps/c".targets.build]
+command = "mkdir -p dist && cat src/c.txt > dist/out.txt && echo built c"
