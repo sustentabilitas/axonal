@@ -816,7 +816,7 @@ fn hash_task(
     } = *task;
     let mut fields = Fields::new();
     fields
-        .add("format", "axonal-task-v2")
+        .add("format", "axonal-task-v3")
         .add("project", &project.name)
         .add("root", display_root(&project.root))
         .add("target", &id.target)
@@ -976,13 +976,6 @@ impl WorkspaceInputs {
                 && f.to_str()
                     .is_some_and(|name| JS_CONFIG_PREFIXES.iter().any(|p| name.starts_with(p)))
         });
-        let globs: Vec<String> = ws
-            .config
-            .workspace
-            .inputs
-            .iter()
-            .map(|glob| format!("{}{glob}", files::WORKSPACE_PREFIX))
-            .collect();
         Ok(WorkspaceInputs {
             cargo: CARGO_WORKSPACE_FILES.iter().map(PathBuf::from).collect(),
             js: JS_WORKSPACE_FILES
@@ -991,8 +984,58 @@ impl WorkspaceInputs {
                 .chain(ts::config_files(&ws.root))
                 .chain(js_configs.cloned())
                 .collect(),
-            every: workspace_matches(ws, &Patterns::new(&globs)?),
+            every: workspace_matches(ws, &workspace_input_patterns(ws)?),
         })
+    }
+}
+
+/// `[workspace] inputs` as `{workspace}/` patterns.
+fn workspace_input_patterns(ws: &Workspace) -> Result<Patterns> {
+    let globs: Vec<String> = ws
+        .config
+        .workspace
+        .inputs
+        .iter()
+        .map(|glob| format!("{}{glob}", files::WORKSPACE_PREFIX))
+        .collect();
+    Patterns::new(&globs)
+}
+
+fn is_tsconfig(name: &str) -> bool {
+    name.starts_with("tsconfig") && name.ends_with(".json")
+}
+
+/// Decides whether a workspace-relative path is an implicit input of a project's tasks,
+/// by the rules `task_keys` hashes them by, but by name, so deleted files count too.
+pub struct ImplicitInputs {
+    ts_configs: BTreeSet<PathBuf>,
+    every: Patterns,
+}
+
+impl ImplicitInputs {
+    pub fn new(ws: &Workspace) -> Result<ImplicitInputs> {
+        Ok(ImplicitInputs {
+            ts_configs: ts::config_files(&ws.root).into_iter().collect(),
+            every: workspace_input_patterns(ws)?,
+        })
+    }
+
+    pub fn applies(&self, project: &Project, path: &Path) -> bool {
+        let kinds = &project.kinds;
+        let uses = |kind: Kind| kinds.contains(&kind) || kinds.contains(&Kind::Explicit);
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+        let at_root = path.parent().is_some_and(|dir| dir.as_os_str().is_empty());
+        let listed = |list: &[&str]| list.iter().any(|f| path == Path::new(f));
+        let cargo = uses(Kind::Cargo) && listed(&CARGO_WORKSPACE_FILES);
+        let js = uses(Kind::Js)
+            && (listed(&JS_WORKSPACE_FILES)
+                || self.ts_configs.contains(path)
+                || at_root
+                    && (is_tsconfig(name)
+                        || JS_CONFIG_PREFIXES.iter().any(|p| name.starts_with(p))));
+        let own = path.parent() == Some(project.root.as_path())
+            && (name == "package.json" || name == "Cargo.toml" || is_tsconfig(name));
+        cargo || js || own || self.every.matches_workspace(path)
     }
 }
 
@@ -1131,9 +1174,7 @@ impl<'a> Plan<'a> {
                         && file
                             .file_name()
                             .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                name.starts_with("tsconfig") && name.ends_with(".json")
-                            })
+                            .is_some_and(is_tsconfig)
                 });
                 ecosystems
                     .chain(workspace.every.iter().cloned())
@@ -2161,8 +2202,8 @@ command = "tsc"
 
     const TARGETS: [&str; 4] = ["build", "test", "lint", "fmt"];
 
-    /// `n` explicit projects with random deps and targets, outputs, gitignored literal
-    /// inputs and a `{workspace}/` input.
+    /// `n` explicit projects with random deps and targets, some builds narrowed to `src/**`,
+    /// outputs, gitignored literal inputs and a `{workspace}/` input.
     fn random_workspace(n: usize, seed: u64) -> tempfile::TempDir {
         use std::fmt::Write as _;
         let dir = tempfile::tempdir().unwrap();
@@ -2191,9 +2232,15 @@ inputs = ["src/**"]
             writeln!(config, "[projects.p{i:02}]\ndeps = [{}]\n", deps.join(", ")).unwrap();
             for t in TARGETS {
                 if t == "build" || !rng.next().is_multiple_of(3) {
+                    let narrow = t == "build" && rng.next().is_multiple_of(3);
                     writeln!(
                         config,
-                        "[projects.p{i:02}.targets.{t}]\ncommand = \"{t} {i}\"\n"
+                        "[projects.p{i:02}.targets.{t}]\ncommand = \"{t} {i}\"\n{}",
+                        if narrow {
+                            "inputs = [\"src/**\"]\n"
+                        } else {
+                            ""
+                        }
                     )
                     .unwrap();
                 }
@@ -2262,6 +2309,56 @@ inputs = ["src/**"]
     }
 
     #[test]
+    fn implicit_input_rules_cover_every_implicitly_hashed_file() {
+        let random = random_workspace(30, 3);
+        let mixed = mixed_workspace();
+        write(
+            mixed.path(),
+            "tsconfig.json",
+            r#"{"extends":"./configs/base"}"#,
+        );
+        write(mixed.path(), "configs/base.json", "{}");
+        write(mixed.path(), ".eslintrc.json", "{}");
+        write(mixed.path(), "packages/p/tsconfig.build.json", "{}");
+        write(mixed.path(), "tools/gen.sh", "");
+        write(
+            mixed.path(),
+            "axonal.toml",
+            "[workspace]\ninputs = [\"tools/**\"]\n\n[projects.\"packages/p\".targets.build]\ninputs = [\"src/**\"]\n",
+        );
+        for dir in [&random, &mixed] {
+            let ws = Workspace::discover(dir.path()).unwrap();
+            let rules = ImplicitInputs::new(&ws).unwrap();
+            let mut plan = Plan::new(&ws);
+            let mut checked = 0;
+            for project in ws.projects.values() {
+                for path in plan.implicit(project).unwrap().iter() {
+                    assert!(
+                        rules.applies(project, path),
+                        "{}: {}",
+                        project.name,
+                        path.display()
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 10, "{checked}");
+        }
+        let ws = Workspace::discover(mixed.path()).unwrap();
+        let rules = ImplicitInputs::new(&ws).unwrap();
+        let (c, p) = (&ws.projects["c"], &ws.projects["p"]);
+        assert!(rules.applies(c, Path::new("tools/gen.sh")));
+        assert!(rules.applies(c, Path::new("rust-toolchain.toml")));
+        assert!(!rules.applies(p, Path::new("rust-toolchain.toml")));
+        assert!(
+            rules.applies(p, Path::new("prettier.config.mjs")),
+            "deleted files match by name"
+        );
+        assert!(!rules.applies(p, Path::new("packages/p/src/index.ts")));
+        assert!(!rules.applies(c, Path::new("packages/p/package.json")));
+    }
+
+    #[test]
     fn memo_file_edits_change_exactly_the_expected_keys_seed_7() {
         file_edits_change_exactly_the_expected_keys(7);
     }
@@ -2309,6 +2406,45 @@ inputs = ["src/**"]
         }
         assert!(candidates.len() > 50, "{}", candidates.len());
         assert_eq!(all_keys(&ws, &graph), base);
+    }
+
+    #[test]
+    fn affected_covers_every_task_whose_key_an_edit_changes() {
+        for seed in [7, 9] {
+            let dir = random_workspace(25, seed);
+            let ws = Workspace::discover(dir.path()).unwrap();
+            let graph = every_target(&ws);
+            let base = all_keys(&ws, &graph);
+            let candidates: BTreeSet<PathBuf> = ws
+                .files
+                .iter()
+                .cloned()
+                .chain(graph.order.iter().flat_map(|id| reference_files(&ws, id)))
+                .filter(|f| dir.path().join(f).is_file())
+                .filter(|f| !matches!(f.to_str(), Some("pnpm-lock.yaml" | "Cargo.lock")))
+                .collect();
+            for file in &candidates {
+                let abs = dir.path().join(file);
+                let original = fs::read(&abs).unwrap();
+                fs::write(&abs, [original.as_slice(), b"!"].concat()).unwrap();
+                let edited = all_keys(&ws, &graph);
+                fs::write(&abs, &original).unwrap();
+                let changed = BTreeSet::from([file.clone()]);
+                let affected =
+                    crate::affected::compute(&ws, &graph, &changed, &BTreeSet::new()).unwrap();
+                let missed: Vec<&TaskId> = graph
+                    .order
+                    .iter()
+                    .filter(|id| base[*id] != edited[*id] && !affected.tasks.contains_key(*id))
+                    .collect();
+                assert!(
+                    missed.is_empty(),
+                    "seed {seed} {}: {missed:?}",
+                    file.display()
+                );
+            }
+            assert!(candidates.len() > 50, "{}", candidates.len());
+        }
     }
 
     #[test]

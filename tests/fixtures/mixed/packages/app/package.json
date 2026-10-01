@@ -1,0 +1,1 @@
+{ "name": "@mixed/app", "scripts": { "build": "echo app" }, "dependencies": { "@mixed/ui": "workspace:*", "is-odd": "3.0.1" } }

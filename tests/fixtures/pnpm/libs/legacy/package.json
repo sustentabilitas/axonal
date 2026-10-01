@@ -1,0 +1,1 @@
+{ "name": "@acme/legacy", "scripts": { "build": "echo legacy" } }

@@ -1,0 +1,1 @@
+{ "name": "@mixed/ui", "scripts": { "build": "echo ui" }, "dependencies": { "left-pad": "1.3.0" } }

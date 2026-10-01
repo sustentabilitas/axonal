@@ -1,0 +1,14 @@
+[targets.test]
+inputs = ["src/**"]
+
+[projects."libs/money".targets.test]
+command = "echo money"
+
+[projects."libs/billing".targets.test]
+command = "echo billing"
+
+[projects."libs/feat/checkout".targets.test]
+command = "echo checkout"
+
+[projects."apps/shop".targets.test]
+command = "echo shop"

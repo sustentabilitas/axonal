@@ -1,0 +1,10 @@
+{
+  // Path aliases, as Nx generates them.
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@acme/money": ["libs/money/src/index.ts"],
+      "@acme/feat/*": ["libs/feat/*/src/index.ts"],
+    },
+  },
+}

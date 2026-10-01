@@ -1,0 +1,41 @@
+lockfileVersion: '9.0'
+
+importers:
+
+  .: {}
+
+  packages/app:
+    dependencies:
+      '@mixed/ui':
+        specifier: workspace:*
+        version: link:../ui
+      is-odd:
+        specifier: 3.0.1
+        version: 3.0.1
+
+  packages/ui:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+
+  is-number@6.0.0:
+    resolution: {integrity: sha512-x}
+
+  is-odd@3.0.1:
+    resolution: {integrity: sha512-y}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-z}
+
+snapshots:
+
+  is-number@6.0.0: {}
+
+  is-odd@3.0.1:
+    dependencies:
+      is-number: 6.0.0
+
+  left-pad@1.3.0: {}

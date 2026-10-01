@@ -1,0 +1,5 @@
+{
+  "name": "@acme/web",
+  "scripts": { "build": "tsc -p .", "test": "vitest run" },
+  "dependencies": { "@acme/ui": "workspace:*", "react": "^19.0.0" }
+}
