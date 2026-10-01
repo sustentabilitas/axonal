@@ -816,7 +816,7 @@ fn hash_task(
     } = *task;
     let mut fields = Fields::new();
     fields
-        .add("format", "axonal-task-v2")
+        .add("format", "axonal-task-v3")
         .add("project", &project.name)
         .add("root", display_root(&project.root))
         .add("target", &id.target)

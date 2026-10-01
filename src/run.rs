@@ -21,7 +21,7 @@ use tokio::{
 };
 
 use crate::{
-    cache::{CacheError, Meta, Store, archive},
+    cache::{CacheError, LogLine, Meta, Store, archive},
     files::Patterns,
     graph::{TaskGraph, TaskId, Workspace},
     hash::Key,
@@ -278,7 +278,8 @@ impl Job {
         if cacheable {
             match self.restore(&target.outputs).await {
                 Ok(Some(logs)) => {
-                    logs.lines().for_each(|line| self.emit(line, false));
+                    logs.iter()
+                        .for_each(|line| self.emit(&line.text, line.stderr));
                     return (self.result(Outcome::CacheHit, Some(0), started), warnings);
                 }
                 Ok(None) => {}
@@ -293,7 +294,7 @@ impl Job {
             Err(e) => {
                 let message = format!("failed to start `{}`: {e}", target.command);
                 self.emit(&message, true);
-                (-1, message)
+                (-1, vec![])
             }
         };
         if code == 0 && cacheable {
@@ -326,11 +327,11 @@ impl Job {
 
     /// Replays a cached success, replacing the outputs present. Corrupt entries are removed
     /// by the store, broken archives here; both surface as errors (warned, then run).
-    async fn restore(&self, outputs: &[String]) -> anyhow::Result<Option<String>> {
+    async fn restore(&self, outputs: &[String]) -> anyhow::Result<Option<Vec<LogLine>>> {
         let patterns = Patterns::new(outputs)?;
         let (store, key, root) = (self.store.clone(), self.key.clone(), self.ws.root.clone());
         let project_root = self.ws.projects[&self.id.project].root.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<LogLine>>> {
             let Some(entry) = store.get(&key)? else {
                 return Ok(None);
             };
@@ -355,7 +356,7 @@ impl Job {
         outputs: &[String],
         exit_code: i32,
         duration_ms: u64,
-        logs: String,
+        logs: Vec<LogLine>,
     ) -> anyhow::Result<()> {
         let patterns = Patterns::new(outputs)?;
         let (store, key, root) = (self.store.clone(), self.key.clone(), self.ws.root.clone());
@@ -369,7 +370,7 @@ impl Job {
         .await?
     }
 
-    async fn spawn(&self, command: &str, cwd: &Path) -> io::Result<(i32, String)> {
+    async fn spawn(&self, command: &str, cwd: &Path) -> io::Result<(i32, Vec<LogLine>)> {
         let mut child = shell(command)
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -378,7 +379,7 @@ impl Job {
             .kill_on_drop(true)
             .spawn()?;
         let group = Group::of(&child);
-        let logs = Mutex::new(String::new());
+        let logs = Mutex::new(Vec::new());
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let (out, err) = tokio::join!(
             self.pump(stdout, &logs, false),
@@ -396,7 +397,7 @@ impl Job {
     async fn pump(
         &self,
         stream: Option<impl AsyncRead + Unpin>,
-        logs: &Mutex<String>,
+        logs: &Mutex<Vec<LogLine>>,
         is_stderr: bool,
     ) -> io::Result<()> {
         let Some(stream) = stream else {
@@ -409,9 +410,12 @@ impl Job {
                 let text = String::from_utf8_lossy(&buf);
                 let line = text.trim_end_matches(['\n', '\r']);
                 self.emit(line, is_stderr);
-                let mut captured = logs.lock().unwrap_or_else(PoisonError::into_inner);
-                captured.push_str(line);
-                captured.push('\n');
+                logs.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(LogLine {
+                        stderr: is_stderr,
+                        text: line.into(),
+                    });
             }
             buf.clear();
         }
@@ -577,6 +581,52 @@ mod tests {
             use_cache: true,
             json: true,
         }
+    }
+
+    /// A workspace at `root` with a directory for each project.
+    fn ws_at(root: &Path, projects: Vec<crate::graph::Project>) -> Workspace {
+        projects
+            .iter()
+            .for_each(|p| std::fs::create_dir_all(root.join(&p.name)).unwrap());
+        workspace(projects).tap_mut(|ws| ws.root = root.to_path_buf())
+    }
+
+    /// A one-project workspace whose `build` runs `command`.
+    fn single(root: &Path, command: &str) -> (Arc<Workspace>, TaskGraph) {
+        let p = project("p", &[], &[("build", &[])])
+            .tap_mut(|p| p.targets.get_mut("build").unwrap().command = command.into());
+        let ws = ws_at(root, vec![p]);
+        let graph = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        (Arc::new(ws), graph)
+    }
+
+    fn stored(store: &Arc<dyn Store>, graph: &TaskGraph) -> Option<Meta> {
+        store
+            .get(&keys(graph)[&graph.order[0]])
+            .unwrap()
+            .map(|entry| entry.meta)
+    }
+
+    fn line(stderr: bool, text: &str) -> LogLine {
+        LogLine {
+            stderr,
+            text: text.into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn logs_are_stored_with_their_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Lines on different pipes are ordered as read, so the pause makes this one certain.
+        let (ws, graph) = single(&root, "echo out; sleep 0.2; echo err >&2");
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
+        assert_eq!(
+            stored(&store, &graph).unwrap().logs,
+            [line(false, "out"), line(true, "err")]
+        );
     }
 
     #[cfg(unix)]

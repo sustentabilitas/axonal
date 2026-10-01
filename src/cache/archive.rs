@@ -420,7 +420,7 @@ mod tests {
             key: Key("k".into()),
             exit_code: 0,
             duration_ms: 1,
-            logs: String::new(),
+            logs: vec![],
             outputs: paths(outputs),
             unpacked_bytes,
             archive_blake3: String::new(),
@@ -438,7 +438,7 @@ mod tests {
             .map(|(rel, _)| PathBuf::from(rel))
             .collect::<Vec<_>>();
         let packed = pack(src.path(), &rels, 0).unwrap();
-        let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
+        let meta = Meta::new(Key("k".into()), 0, 1, vec![], &packed);
         (src, packed, meta)
     }
 
@@ -548,7 +548,7 @@ mod tests {
             .set_modified(mtime)
             .unwrap();
         let packed = pack(src.path(), &paths(&["bin/run"]), 0).unwrap();
-        let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
+        let meta = Meta::new(Key("k".into()), 0, 1, vec![], &packed);
 
         let dst = tempfile::tempdir().unwrap();
         restore(dst.path(), &meta, File::open(packed.path()).unwrap(), &[]).unwrap();
@@ -896,7 +896,7 @@ mod tests {
         };
         let packed = pack_with(src.path(), &paths(&["log.txt"]), 0, &grow).unwrap();
         assert_eq!(packed.unpacked_bytes, 5);
-        let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
+        let meta = Meta::new(Key("k".into()), 0, 1, vec![], &packed);
         let dst = tempfile::tempdir().unwrap();
         restore(dst.path(), &meta, File::open(packed.path()).unwrap(), &[]).unwrap();
         assert_eq!(
@@ -927,7 +927,7 @@ mod tests {
         let body = "multithreaded ".repeat(200_000);
         touch(src.path(), "dist/big.txt", &body);
         let packed = pack(src.path(), &paths(&["dist/big.txt"]), 2).unwrap();
-        let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
+        let meta = Meta::new(Key("k".into()), 0, 1, vec![], &packed);
         let dst = tempfile::tempdir().unwrap();
         restore(dst.path(), &meta, File::open(packed.path()).unwrap(), &[]).unwrap();
         assert_eq!(
@@ -1036,7 +1036,7 @@ mod tests {
             .collect::<Vec<_>>();
         let packed = pack(src.path(), &files, 0).unwrap();
         assert_eq!(packed.unpacked_bytes, 200 << 20);
-        let meta = Meta::new(Key("k".into()), 0, 1, String::new(), &packed);
+        let meta = Meta::new(Key("k".into()), 0, 1, vec![], &packed);
         let dst = tempfile::tempdir().unwrap();
         restore(dst.path(), &meta, File::open(packed.path()).unwrap(), &[]).unwrap();
         assert_eq!(crate::files::list(dst.path()).unwrap().len(), 200);

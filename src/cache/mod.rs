@@ -20,12 +20,19 @@ pub use local::Local;
 /// beside the cache so both can be renamed into place.
 pub const TMP_DIR: &str = ".axonal/tmp";
 
+/// A line of a task's captured output, replayed to the stream it was written to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLine {
+    pub stderr: bool,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
     pub key: Key,
     pub exit_code: i32,
     pub duration_ms: u64,
-    pub logs: String,
+    pub logs: Vec<LogLine>,
     /// Workspace-relative output files in the archive; their count bounds extraction.
     pub outputs: Vec<PathBuf>,
     /// Total size of the output files, which bounds extraction.
@@ -34,7 +41,13 @@ pub struct Meta {
 }
 
 impl Meta {
-    pub fn new(key: Key, exit_code: i32, duration_ms: u64, logs: String, packed: &Packed) -> Meta {
+    pub fn new(
+        key: Key,
+        exit_code: i32,
+        duration_ms: u64,
+        logs: Vec<LogLine>,
+        packed: &Packed,
+    ) -> Meta {
         Meta {
             key,
             exit_code,

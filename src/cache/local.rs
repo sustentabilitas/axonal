@@ -454,7 +454,7 @@ fn is_key(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{Packed, archive};
+    use crate::cache::{LogLine, Packed, archive};
     use std::time::Duration;
 
     /// A packed one-file archive whose contents and logs are `tag`, from its own source tree.
@@ -462,7 +462,11 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         fs::write(src.path().join("out.txt"), tag).unwrap();
         let packed = archive::pack(src.path(), &[PathBuf::from("out.txt")], 0).unwrap();
-        let meta = Meta::new(key.clone(), 0, 5, tag.into(), &packed);
+        let logs = vec![LogLine {
+            stderr: false,
+            text: tag.into(),
+        }];
+        let meta = Meta::new(key.clone(), 0, 5, logs, &packed);
         (src, meta, packed)
     }
 
@@ -664,7 +668,10 @@ mod tests {
             })
         });
         let entry = store.get(&key).unwrap().unwrap();
-        assert_eq!(restored(entry), store.get(&key).unwrap().unwrap().meta.logs);
+        assert_eq!(
+            restored(entry),
+            store.get(&key).unwrap().unwrap().meta.logs[0].text
+        );
         assert_eq!(names(&store), [".lock", "k1.json", "k1.tar.zst"]);
     }
 
