@@ -2202,8 +2202,8 @@ command = "tsc"
 
     const TARGETS: [&str; 4] = ["build", "test", "lint", "fmt"];
 
-    /// `n` explicit projects with random deps and targets, outputs, gitignored literal
-    /// inputs and a `{workspace}/` input.
+    /// `n` explicit projects with random deps and targets, some builds narrowed to `src/**`,
+    /// outputs, gitignored literal inputs and a `{workspace}/` input.
     fn random_workspace(n: usize, seed: u64) -> tempfile::TempDir {
         use std::fmt::Write as _;
         let dir = tempfile::tempdir().unwrap();
@@ -2232,9 +2232,11 @@ inputs = ["src/**"]
             writeln!(config, "[projects.p{i:02}]\ndeps = [{}]\n", deps.join(", ")).unwrap();
             for t in TARGETS {
                 if t == "build" || !rng.next().is_multiple_of(3) {
+                    let narrow = t == "build" && rng.next().is_multiple_of(3);
                     writeln!(
                         config,
-                        "[projects.p{i:02}.targets.{t}]\ncommand = \"{t} {i}\"\n"
+                        "[projects.p{i:02}.targets.{t}]\ncommand = \"{t} {i}\"\n{}",
+                        if narrow { "inputs = [\"src/**\"]\n" } else { "" }
                     )
                     .unwrap();
                 }
@@ -2400,6 +2402,45 @@ inputs = ["src/**"]
         }
         assert!(candidates.len() > 50, "{}", candidates.len());
         assert_eq!(all_keys(&ws, &graph), base);
+    }
+
+    #[test]
+    fn affected_covers_every_task_whose_key_an_edit_changes() {
+        for seed in [7, 9] {
+            let dir = random_workspace(25, seed);
+            let ws = Workspace::discover(dir.path()).unwrap();
+            let graph = every_target(&ws);
+            let base = all_keys(&ws, &graph);
+            let candidates: BTreeSet<PathBuf> = ws
+                .files
+                .iter()
+                .cloned()
+                .chain(graph.order.iter().flat_map(|id| reference_files(&ws, id)))
+                .filter(|f| dir.path().join(f).is_file())
+                .filter(|f| !matches!(f.to_str(), Some("pnpm-lock.yaml" | "Cargo.lock")))
+                .collect();
+            for file in &candidates {
+                let abs = dir.path().join(file);
+                let original = fs::read(&abs).unwrap();
+                fs::write(&abs, [original.as_slice(), b"!"].concat()).unwrap();
+                let edited = all_keys(&ws, &graph);
+                fs::write(&abs, &original).unwrap();
+                let changed = BTreeSet::from([file.clone()]);
+                let affected =
+                    crate::affected::compute(&ws, &graph, &changed, &BTreeSet::new()).unwrap();
+                let missed: Vec<&TaskId> = graph
+                    .order
+                    .iter()
+                    .filter(|id| base[*id] != edited[*id] && !affected.tasks.contains_key(*id))
+                    .collect();
+                assert!(
+                    missed.is_empty(),
+                    "seed {seed} {}: {missed:?}",
+                    file.display()
+                );
+            }
+            assert!(candidates.len() > 50, "{}", candidates.len());
+        }
     }
 
     #[test]

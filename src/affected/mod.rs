@@ -153,10 +153,14 @@ pub fn compute(
             .into_iter()
             .collect();
         causes.extend(base_causes[p.name.as_str()].iter().cloned());
+        let patterns = changes.patterns(p, &id.target);
         causes.extend(
             upstream[p.name.as_str()]
                 .iter()
-                .filter(|d| changed.contains(*d))
+                .filter(|d| {
+                    changed.contains(*d)
+                        || !changes.matching(&ws.projects[**d], patterns).is_empty()
+                })
                 .map(|d| Cause::Dependency {
                     project: d.to_string(),
                 }),
@@ -234,12 +238,21 @@ impl<'a> Changes<'a> {
         self.owned.get(&p.root).map_or(&[], Vec::as_slice)
     }
 
+    fn patterns(&self, p: &Project, target: &str) -> &Patterns {
+        &self.patterns[&p.name][target]
+    }
+
     fn own_hits(&self, p: &Project, target: &str) -> Vec<PathBuf> {
-        let patterns = &self.patterns[&p.name][target];
-        self.owned(p)
+        self.matching(p, self.patterns(p, target))
+    }
+
+    /// Changed files `owner` owns matching the project-relative `patterns`, which may be
+    /// another project's: dependents hash their dependencies' files through their own inputs.
+    fn matching(&self, owner: &Project, patterns: &Patterns) -> Vec<PathBuf> {
+        self.owned(owner)
             .iter()
             .filter(|f| {
-                f.strip_prefix(&p.root)
+                f.strip_prefix(&owner.root)
                     .is_ok_and(|rel| patterns.matches_project(rel))
             })
             .map(|f| (*f).clone())
@@ -247,7 +260,7 @@ impl<'a> Changes<'a> {
     }
 
     fn workspace_hits(&self, p: &Project, target: &str) -> Vec<PathBuf> {
-        let patterns = &self.patterns[&p.name][target];
+        let patterns = self.patterns(p, target);
         self.files
             .iter()
             .filter(|f| patterns.matches_workspace(f))
@@ -400,6 +413,24 @@ mod tests {
             a.tasks[&TaskId::new("lib", "lint")],
             vec![Cause::Manifest {
                 file: "lib/package.json".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn dependents_see_dependency_files_through_their_own_inputs() {
+        let mut dep = project("d", &[], &[("build", &[])]);
+        dep.targets.get_mut("build").unwrap().inputs = vec!["src/**".into()];
+        let app = project("app", &["d"], &[("test", &[])]);
+        let ws = workspace(vec![dep, app]);
+        let graph = TaskGraph::build(&ws, &["build".into(), "test".into()], None).unwrap();
+        let files = BTreeSet::from([PathBuf::from("d/assets/data.json")]);
+        let a = compute(&ws, &graph, &files, &BTreeSet::new()).unwrap();
+        assert_eq!(ids(&a), ["app:test"]);
+        assert_eq!(
+            a.tasks[&TaskId::new("app", "test")],
+            vec![Cause::Dependency {
+                project: "d".into()
             }]
         );
     }
