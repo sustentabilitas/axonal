@@ -3,14 +3,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, Metadata},
     hash::Hash,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     rc::Rc,
+    sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,7 +22,7 @@ use crate::{
     config::DepsUsage,
     error::{Error, Result},
     files::{self, Patterns, display_root},
-    graph::{Kind, Project, Target, TaskGraph, TaskId, Workspace},
+    graph::{Kind, Project, Target, TaskGraph, TaskId, Workspace, infer::ts},
 };
 
 const FILE_HASHES: &str = ".axonal/filehash.json";
@@ -43,6 +44,8 @@ const FILE_HASHES_VERSION: u32 = 2;
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 /// The digest of a path that doesn't exist.
 const MISSING: &str = "missing";
+/// The digest of a FIFO, socket or device, which is never read.
+const SPECIAL: &str = "special";
 
 /// Content hashes keyed by UTF-8 path, reused across runs while a file's [`Stat`] is
 /// unchanged. Symlinks and non-UTF-8 paths are always hashed afresh.
@@ -108,6 +111,25 @@ struct Hashed {
     stamp: Option<Stamp>,
 }
 
+/// What hashing one path yields.
+enum Computed {
+    Hashed(Hashed),
+    /// A link, with text `link`, to a directory: its digest folds in `entries`, every
+    /// non-directory path under the link (see [`dir_entries`]), once they're hashed
+    /// through it.
+    DirLink {
+        link: PathBuf,
+        entries: Vec<PathBuf>,
+    },
+}
+
+fn uncached(digest: impl Into<String>) -> Computed {
+    Computed::Hashed(Hashed {
+        digest: digest.into(),
+        stamp: None,
+    })
+}
+
 impl FileHashCache {
     /// A missing, unreadable or other-version cache file is an empty cache.
     pub fn load(root: &Path) -> Self {
@@ -124,12 +146,15 @@ impl FileHashCache {
             .unwrap_or_default()
     }
 
-    /// Writes the entries hashed since `load`, if anything changed.
+    /// Writes the entries, if anything changed, dropping those whose paths no longer
+    /// exist (entries for paths a filtered run didn't hash are kept).
     pub fn save(&self, root: &Path) -> Result<()> {
         let kept: BTreeMap<&String, &Stamp> = self
             .entries
-            .iter()
-            .filter(|(path, _)| self.seen.contains(*path))
+            .par_iter()
+            .filter(|(path, _)| {
+                self.seen.contains(*path) || fs::symlink_metadata(root.join(path)).is_ok()
+            })
             .collect();
         if !self.dirty && kept.len() == self.entries.len() {
             return Ok(());
@@ -150,67 +175,142 @@ impl FileHashCache {
     }
 
     /// The digest of `rel` (workspace-relative): its content and executable bit, a
-    /// symlink's text and target, or `missing`.
+    /// symlink's text and target (a directory's contents included), `special` for FIFOs,
+    /// sockets and devices, or `missing`.
     pub fn hash(&mut self, root: &Path, rel: &Path) -> Result<String> {
-        let hashed = self.compute(root, rel)?;
-        self.record(rel, hashed.stamp);
-        Ok(hashed.digest)
+        let mut digests = self.hash_all(root, vec![rel])?;
+        Ok(digests.remove(rel).unwrap_or_else(|| MISSING.into()))
     }
 
-    /// Digests of `paths`, hashed in parallel.
+    /// Digests of `paths`, hashed in parallel. A directory link folds in the digests of
+    /// the entries under it, hashed and stamped through the link. If several paths fail,
+    /// the error is the one for the smallest.
     fn hash_all<'p>(
         &mut self,
         root: &Path,
         paths: Vec<&'p Path>,
     ) -> Result<HashMap<&'p Path, String>> {
-        let hashed = paths
-            .into_par_iter()
-            .map(|path| self.compute(root, path).map(|hashed| (path, hashed)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(hashed
+        let computed = self.compute_all(root, paths, Follow::Directories)?;
+        let inner: Vec<PathBuf> = computed
+            .iter()
+            .flat_map(|(path, computed)| match computed {
+                Computed::DirLink { entries, .. } => {
+                    entries.iter().map(|entry| path.join(entry)).collect()
+                }
+                Computed::Hashed(_) => Vec::new(),
+            })
+            .collect();
+        let inner: HashMap<&Path, String> = self
+            .compute_all(
+                root,
+                inner.iter().map(PathBuf::as_path).collect(),
+                Follow::Nothing,
+            )?
             .into_iter()
-            .map(|(path, hashed)| {
-                self.record(path, hashed.stamp);
-                (path, hashed.digest)
+            .map(|(path, computed)| (path, digest_of(computed)))
+            .collect();
+        Ok(computed
+            .into_iter()
+            .map(|(path, computed)| match computed {
+                Computed::Hashed(hashed) => (path, hashed.digest),
+                Computed::DirLink { link, entries } => {
+                    let digests = entries
+                        .iter()
+                        .map(|entry| (entry.as_path(), inner[path.join(entry).as_path()].as_str()));
+                    (path, link_digest(&link, dir_fields(digests)))
+                }
             })
             .collect())
     }
 
-    fn compute(&self, root: &Path, rel: &Path) -> Result<Hashed> {
+    /// Computes `paths` in parallel and records their stamps.
+    fn compute_all<'p>(
+        &mut self,
+        root: &Path,
+        paths: Vec<&'p Path>,
+        follow: Follow,
+    ) -> Result<Vec<(&'p Path, Computed)>> {
+        let (computed, failed): (Vec<_>, Vec<_>) = paths
+            .into_par_iter()
+            .map(|path| (path, self.compute(root, path, follow)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .partition(|(_, computed)| computed.is_ok());
+        if let Some((_, Err(error))) = failed.into_iter().min_by_key(|(path, _)| *path) {
+            return Err(error);
+        }
+        Ok(computed
+            .into_iter()
+            .filter_map(|(path, computed)| computed.ok().map(|computed| (path, computed)))
+            .map(|(path, mut computed)| {
+                let stamp = match &mut computed {
+                    Computed::Hashed(hashed) => hashed.stamp.take(),
+                    Computed::DirLink { .. } => None,
+                };
+                self.record(path, stamp);
+                (path, computed)
+            })
+            .collect())
+    }
+
+    fn compute(&self, root: &Path, rel: &Path, follow: Follow) -> Result<Computed> {
         let path = root.join(rel);
-        let uncached = |digest: String| Hashed {
-            digest,
-            stamp: None,
-        };
         let meta = match fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(uncached(MISSING.into())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(uncached(MISSING)),
             Err(e) => return Err(input_error(rel, e)),
             Ok(meta) => meta,
         };
         if meta.is_symlink() {
-            return symlink_digest(&path, rel).map(uncached);
+            return link(&path, rel, follow);
         }
         if meta.is_dir() {
-            return Ok(uncached("dir".into()));
+            return Ok(uncached("dir"));
         }
-        let stat = Stat::of(&meta);
+        if !meta.is_file() {
+            return Ok(uncached(SPECIAL));
+        }
+        self.regular(root, rel, &meta, follow)
+    }
+
+    /// `rel`, which `meta` (its `lstat`) says is a regular file: from its stamp while the
+    /// stat is unchanged, else read through [`read_regular`], so whatever replaced it
+    /// since is hashed as what it now is, and stamped only if the handle's stat still
+    /// matches `meta`.
+    fn regular(
+        &self,
+        root: &Path,
+        rel: &Path,
+        meta: &Metadata,
+        follow: Follow,
+    ) -> Result<Computed> {
+        let path = root.join(rel);
+        let stat = Stat::of(meta);
         let cached = rel
             .to_str()
             .and_then(|key| self.entries.get(key))
             .filter(|stamp| stamp.stat == stat)
             .map(|stamp| stamp.hash.clone());
-        let content = match cached.map_or_else(|| content_hash(&path), Ok) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(uncached(MISSING.into())),
-            Err(e) => return Err(input_error(rel, e)),
-            Ok(content) => content,
+        let (opened, stamped) = match cached {
+            Some(content) => ((meta.clone(), content), true),
+            None => match read_regular(&path, false) {
+                Ok(Some((opened, content))) => {
+                    let same = Stat::of(&opened) == stat;
+                    ((opened, content), same)
+                }
+                Ok(None) => return Ok(uncached(SPECIAL)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(uncached(MISSING)),
+                Err(_) if is_symlink(&path) => return link(&path, rel, follow),
+                Err(e) => return Err(input_error(rel, e)),
+            },
         };
-        Ok(Hashed {
-            digest: file_digest(&meta, &content),
-            stamp: (!is_racy(&meta)).then_some(Stamp {
+        let (opened, content) = opened;
+        Ok(Computed::Hashed(Hashed {
+            digest: file_digest(&opened, &content),
+            stamp: (stamped && !is_racy(&opened)).then_some(Stamp {
                 stat,
                 hash: content,
             }),
-        })
+        }))
     }
 
     fn record(&mut self, rel: &Path, stamp: Option<Stamp>) {
@@ -234,10 +334,39 @@ fn input_error(rel: &Path, source: io::Error) -> Error {
     }
 }
 
-fn content_hash(path: &Path) -> io::Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(fs::File::open(path)?)?;
-    Ok(hasher.finalize().to_hex().to_string())
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink())
+}
+
+/// Opens `path` non-blocking (so a FIFO opens at once), without becoming a controlling
+/// terminal, and without following a final symlink unless `follow`, then checks the
+/// handle itself: `None` unless it's a regular file.
+fn open_regular(path: &Path, follow: bool) -> io::Result<Option<(fs::File, Metadata)>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | nofollow);
+    }
+    #[cfg(not(unix))]
+    let _ = follow;
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    Ok(meta.is_file().then_some((file, meta)))
+}
+
+/// The handle's metadata and content digest, if `path` opens (see [`open_regular`]) as a
+/// regular file, so a path swapped for a FIFO or device after its `lstat` is never read.
+fn read_regular(path: &Path, follow: bool) -> io::Result<Option<(Metadata, String)>> {
+    open_regular(path, follow)?
+        .map(|(file, meta)| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_reader(file)?;
+            Ok((meta, hasher.finalize().to_hex().to_string()))
+        })
+        .transpose()
 }
 
 fn file_digest(meta: &Metadata, content: &str) -> String {
@@ -254,23 +383,111 @@ fn file_digest(meta: &Metadata, content: &str) -> String {
     format!("file:{}:{content}", if executable { "x" } else { "-" })
 }
 
-/// The link text plus what it resolves to: a file's digest, `dir`, or `dangling` (which
-/// covers loops too).
+/// Whether a symlink to a directory folds in the directory's contents.
+#[derive(Clone, Copy)]
+enum Follow {
+    Directories,
+    /// For entries under a followed link, whose nested directory links [`dir_entries`]
+    /// has already expanded.
+    Nothing,
+}
+
+/// A symlink found by `lstat`: a followed link to a directory lists the entries to fold
+/// in; anything else is hashed now.
+fn link(path: &Path, rel: &Path, follow: Follow) -> Result<Computed> {
+    match (follow, fs::canonicalize(path).ok().filter(|t| t.is_dir())) {
+        (Follow::Directories, Some(target)) => Ok(Computed::DirLink {
+            link: fs::read_link(path).map_err(|e| input_error(rel, e))?,
+            entries: dir_entries(&target, &mut HashSet::from([target.clone()]))
+                .map_err(|e| input_error(rel, e))?,
+        }),
+        _ => symlink_digest(path, rel).map(uncached),
+    }
+}
+
+/// A computed path's digest, for paths that aren't followed into directories.
+fn digest_of(computed: Computed) -> String {
+    match computed {
+        Computed::Hashed(hashed) => hashed.digest,
+        Computed::DirLink { link, .. } => link_digest(&link, "dir".into()),
+    }
+}
+
+/// The link text plus what it resolves to: a file's digest, `dir`, `special`, or
+/// `dangling` (which covers loops too).
 fn symlink_digest(path: &Path, rel: &Path) -> Result<String> {
     let link = fs::read_link(path).map_err(|e| input_error(rel, e))?;
     let target = match fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => "dir".to_string(),
-        Ok(meta) => match content_hash(path) {
-            Ok(content) => file_digest(&meta, &content),
+        Ok(meta) if meta.is_dir() => "dir".into(),
+        Ok(meta) if !meta.is_file() => SPECIAL.into(),
+        Ok(_) => match read_regular(path, true) {
+            Ok(Some((meta, content))) => file_digest(&meta, &content),
+            Ok(None) => SPECIAL.into(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => "dangling".into(),
             Err(e) => return Err(input_error(rel, e)),
         },
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(input_error(rel, e)),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Err(input_error(rel, e));
+        }
         Err(_) => "dangling".into(),
     };
+    Ok(link_digest(&link, target))
+}
+
+fn link_digest(link: &Path, target: String) -> String {
     let mut fields = Fields::new();
-    fields.add("link", path_bytes(&link)).add("target", target);
-    Ok(format!("link:{}", fields.finish()))
+    fields.add("link", path_bytes(link)).add("target", target);
+    format!("link:{}", fields.finish())
+}
+
+/// Entries sorted by their path relative to the directory.
+fn dir_fields<'e>(entries: impl Iterator<Item = (&'e Path, &'e str)>) -> String {
+    let mut fields = Fields::new();
+    entries.for_each(|(inner, digest)| {
+        fields.add(path_bytes(inner), digest);
+    });
+    format!("dir:{}", fields.finish())
+}
+
+/// Directories never descended into below a followed directory link.
+const UNWALKED_DIRS: [&str; 3] = [".git", ".axonal", "node_modules"];
+
+/// Every non-directory entry under the canonical directory `dir`, relative to it and in
+/// sorted order. A directory link is an explicit reference, so ignore rules don't apply
+/// behind it; only [`UNWALKED_DIRS`] are skipped. Nested directory links are listed and
+/// followed too, unless their canonical target is already in `visited`, so loops end.
+fn dir_entries(dir: &Path, visited: &mut HashSet<PathBuf>) -> io::Result<Vec<PathBuf>> {
+    let mut names = match fs::read_dir(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        read => read?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?,
+    };
+    names.sort();
+    names.into_iter().try_fold(Vec::new(), |mut found, name| {
+        let path = dir.join(&name);
+        let unwalked = name.to_str().is_some_and(|n| UNWALKED_DIRS.contains(&n));
+        let descend = match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+            Ok(meta) if meta.is_dir() => {
+                visited.insert(path.clone());
+                (!unwalked).then_some(path)
+            }
+            Ok(meta) => {
+                found.push(PathBuf::from(&name));
+                meta.is_symlink()
+                    .then(|| fs::canonicalize(&path).ok())
+                    .flatten()
+                    .filter(|target| !unwalked && target.is_dir() && visited.insert(target.clone()))
+            }
+        };
+        if let Some(nested) = descend {
+            let inner = dir_entries(&nested, visited)?;
+            found.extend(inner.into_iter().map(|entry| Path::new(&name).join(entry)));
+        }
+        Ok(found)
+    })
 }
 
 fn is_racy(meta: &Metadata) -> bool {
@@ -290,7 +507,8 @@ impl Toolchain {
     /// Node and pnpm for JS workspaces, rustc for Cargo ones, run in parallel from the
     /// workspace root (so `rust-toolchain.toml`, corepack and version managers apply). A
     /// tool that is missing or fails hashes as `missing`; one still running after
-    /// five seconds is killed and hashes as `timeout`.
+    /// five seconds, or whose output doesn't arrive by then, is killed and hashes as its
+    /// binary's identity (see [`binary_identity`]).
     pub fn detect(ws: &Workspace) -> Toolchain {
         let uses = |kind: Kind, manifest: &str| {
             ws.root.join(manifest).is_file()
@@ -366,41 +584,158 @@ fn run_probes(dir: &Path, probes: &[Probe], timeout: Duration) -> BTreeMap<&'sta
     })
 }
 
-/// Version output is small, so the child never blocks on a full stdout pipe before exit.
+/// How long stdout may still take once the probe has exited, however close the deadline.
+const READ_GRACE: Duration = Duration::from_millis(100);
+
+/// Runs `p` in its own process group, killing the whole group at the deadline. Stdout is
+/// read on a detached thread, since a grandchild can hold the pipe open after the child
+/// exits. A probe that times out, or whose output doesn't arrive, hashes as its binary's
+/// identity.
 fn probe(dir: &Path, p: &Probe, timeout: Duration) -> String {
-    let Ok(mut child) = Command::new(p.program)
+    let deadline = Instant::now() + timeout;
+    let mut command = Command::new(p.program);
+    command
         .args(p.args)
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return "missing".into();
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let Ok(mut child) = command.spawn() else {
+        return MISSING.into();
     };
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(PROBE_POLL),
-            Ok(None) => {
-                // A failed kill means the child already exited; `wait` reaps it either way.
-                let _ = child.kill();
-                let _ = child.wait();
-                return "timeout".into();
+    let identity = || binary_identity(dir, p.program, std::env::var_os("PATH").as_deref());
+    let stdout = child.stdout.take().map(|mut out| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = tx.send(out.read_to_string(&mut text).map(|_| text));
+        });
+        rx
+    });
+    loop {
+        match exited(&mut child) {
+            Ok(false) if Instant::now() < deadline => std::thread::sleep(PROBE_POLL),
+            Ok(false) => {
+                kill(&mut child);
+                return identity();
             }
-            Ok(Some(status)) => break status,
-            Err(_) => return "missing".into(),
+            Ok(true) => break,
+            Err(_) => {
+                kill(&mut child);
+                return MISSING.into();
+            }
         }
-    };
-    let mut stdout = String::new();
-    match child
-        .stdout
-        .take()
-        .map(|mut out| out.read_to_string(&mut stdout))
-    {
-        Some(Ok(_)) if status.success() => stdout.trim().to_string(),
-        _ => "missing".into(),
     }
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(READ_GRACE);
+    let output = stdout.map(|rx| rx.recv_timeout(wait));
+    let unfinished = matches!(output, Some(Err(mpsc::RecvTimeoutError::Timeout)));
+    if unfinished {
+        kill_group(&child);
+    }
+    match (output, child.wait()) {
+        _ if unfinished => identity(),
+        (Some(Ok(Ok(text))), Ok(status)) if status.success() => text.trim().to_string(),
+        _ => MISSING.into(),
+    }
+}
+
+/// Whether the child has exited, without reaping it, so its pid, which is also its
+/// process group id, stays reserved until [`Child::wait`].
+#[cfg(unix)]
+fn exited(child: &mut Child) -> io::Result<bool> {
+    // SAFETY: `siginfo_t` is plain data, for which all zeroes is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    // SAFETY: `info` is a valid, writable `siginfo_t`; WNOWAIT leaves the child waitable.
+    match unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, options) } {
+        0 => {
+            // SAFETY: waitid succeeded, so `info` is initialised; with WNOHANG `si_pid`
+            // stays 0 while the child runs.
+            Ok(unsafe { info.si_pid() } != 0)
+        }
+        _ => match io::Error::last_os_error() {
+            e if e.kind() == io::ErrorKind::Interrupted => Ok(false),
+            e => Err(e),
+        },
+    }
+}
+
+#[cfg(not(unix))]
+fn exited(child: &mut Child) -> io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+/// Kills the probe and everything still in its group, then reaps it.
+fn kill(child: &mut Child) {
+    kill_group(child);
+    // A failed kill means the child already exited; `wait` reaps it either way.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Signals the probe's process group, whose id is the probe's pid. The probe is never
+/// reaped before this runs (see [`exited`]), so running or a zombie, it keeps that pid
+/// reserved and no other group can have taken it.
+#[cfg(unix)]
+fn kill_group(child: &Child) {
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: `killpg` only sends a signal, to a group id the unreaped probe still
+        // reserves; ESRCH, when no live member is left, is harmless.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_: &Child) {}
+
+/// What a tool that can't report its version hashes as: `timeout:` plus the canonical
+/// path, size and mtime of the binary `program` resolves to, or `missing` if there's none.
+fn binary_identity(dir: &Path, program: &str, search: Option<&OsStr>) -> String {
+    find_program(dir, program, search)
+        .and_then(|bin| fs::canonicalize(bin).ok())
+        .and_then(|bin| fs::metadata(&bin).ok().map(|meta| (bin, Stat::of(&meta))))
+        .map_or_else(
+            || MISSING.into(),
+            |(bin, stat)| {
+                let mut fields = Fields::new();
+                fields
+                    .add("binary", path_bytes(&bin))
+                    .add("size", stat.size.to_le_bytes())
+                    .add("mtime_ns", stat.mtime_ns.to_le_bytes());
+                format!("timeout:{}", fields.finish())
+            },
+        )
+}
+
+/// Where `program` resolves: itself if it names a path, else the first executable match
+/// in `search`, a `PATH` value. Both are taken relative to `dir`, where probes run.
+fn find_program(dir: &Path, program: &str, search: Option<&OsStr>) -> Option<PathBuf> {
+    let program = Path::new(program);
+    if program.components().count() > 1 {
+        return Some(dir.join(program)).filter(|path| is_executable(path));
+    }
+    search
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|entry| dir.join(entry).join(program))
+        .find(|path| is_executable(path))
+}
+
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| {
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = true;
+        meta.is_file() && executable
+    })
 }
 
 /// Looks up an environment variable; production callers pass `std::env::var_os`.
@@ -552,8 +887,10 @@ fn path_bytes(path: &Path) -> &[u8] {
 }
 
 /// Owned files matching the target's project globs, plus any workspace file matching its
-/// `{workspace}/` globs, plus literal globs naming existing (even gitignored) files, minus
-/// the project's outputs. Excludes implicit inputs. Workspace-relative and sorted.
+/// `{workspace}/` globs, plus literal globs naming existing (even gitignored) files.
+/// Declared outputs stay inputs: ignored ones are already absent from the file list, and
+/// the rest are committed (codegen) or fixed in place. Excludes implicit inputs.
+/// Workspace-relative and sorted.
 pub fn input_files(ws: &Workspace, project: &Project, target: &Target) -> Result<Vec<PathBuf>> {
     Plan::new(ws).own_inputs(project, &target.inputs)
 }
@@ -570,20 +907,33 @@ struct TaskInputs<'a> {
 }
 
 /// Workspace files every Cargo project's tasks depend on, whatever their `inputs`.
-const CARGO_WORKSPACE_FILES: [&str; 6] = [
+const CARGO_WORKSPACE_FILES: [&str; 10] = [
     "Cargo.lock",
     "Cargo.toml",
     ".cargo/config.toml",
     ".cargo/config",
     "rust-toolchain.toml",
     "rust-toolchain",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "clippy.toml",
+    ".clippy.toml",
 ];
-/// Workspace files every JS project's tasks depend on, whatever their `inputs`.
-const JS_WORKSPACE_FILES: [&str; 4] = [
+/// Workspace files every JS project's tasks depend on, whatever their `inputs`, besides
+/// the root tsconfig chain and root files starting with [`JS_CONFIG_PREFIXES`].
+const JS_WORKSPACE_FILES: [&str; 6] = [
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
     "package.json",
     ".npmrc",
+    "biome.json",
+    "biome.jsonc",
+];
+const JS_CONFIG_PREFIXES: [&str; 4] = [
+    "eslint.config.",
+    ".eslintrc",
+    ".prettierrc",
+    "prettier.config.",
 ];
 
 /// `rel` names something other than a directory, gitignored or not.
@@ -591,16 +941,71 @@ fn exists(root: &Path, rel: &Path) -> bool {
     fs::symlink_metadata(root.join(rel)).is_ok_and(|meta| !meta.is_dir())
 }
 
-/// Per-run memos of everything tasks share: glob sets, each project's outputs, the files
-/// matching an inputs list in a project, workspace matches, implicit inputs and
+/// Workspace files matching the `{workspace}/` globs, plus literal ones naming existing
+/// files even if gitignored. Sorted.
+fn workspace_matches(ws: &Workspace, patterns: &Patterns) -> Vec<PathBuf> {
+    if !patterns.has_workspace_globs() {
+        return Vec::new();
+    }
+    let literal = patterns
+        .workspace_literals()
+        .filter_map(|glob| files::normalize(Path::new(glob)))
+        .filter(|path| exists(&ws.root, path));
+    ws.files
+        .iter()
+        .filter(|f| patterns.matches_workspace(f))
+        .cloned()
+        .chain(literal)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Implicit inputs shared across projects, resolved once per run.
+struct WorkspaceInputs {
+    cargo: Vec<PathBuf>,
+    js: Vec<PathBuf>,
+    /// `[workspace] inputs`, hashed by every task.
+    every: Vec<PathBuf>,
+}
+
+impl WorkspaceInputs {
+    fn resolve(ws: &Workspace) -> Result<WorkspaceInputs> {
+        let js_configs = ws.files.iter().filter(|f| {
+            f.parent().is_some_and(|dir| dir.as_os_str().is_empty())
+                && f.to_str()
+                    .is_some_and(|name| JS_CONFIG_PREFIXES.iter().any(|p| name.starts_with(p)))
+        });
+        let globs: Vec<String> = ws
+            .config
+            .workspace
+            .inputs
+            .iter()
+            .map(|glob| format!("{}{glob}", files::WORKSPACE_PREFIX))
+            .collect();
+        Ok(WorkspaceInputs {
+            cargo: CARGO_WORKSPACE_FILES.iter().map(PathBuf::from).collect(),
+            js: JS_WORKSPACE_FILES
+                .iter()
+                .map(PathBuf::from)
+                .chain(ts::config_files(&ws.root))
+                .chain(js_configs.cloned())
+                .collect(),
+            every: workspace_matches(ws, &Patterns::new(&globs)?),
+        })
+    }
+}
+
+/// Per-run memos of everything tasks share: glob sets, the files matching an inputs list
+/// in a project, workspace matches, implicit inputs and
 /// dependency closures.
 struct Plan<'a> {
     ws: &'a Workspace,
     patterns: HashMap<&'a [String], Rc<Patterns>>,
-    outputs: HashMap<&'a str, Rc<Patterns>>,
     owned: HashMap<(&'a str, &'a [String]), Rc<[PathBuf]>>,
     shared: HashMap<&'a [String], Rc<[PathBuf]>>,
     implicit: HashMap<&'a str, Rc<[PathBuf]>>,
+    workspace_inputs: Option<Rc<WorkspaceInputs>>,
     closures: HashMap<&'a str, Rc<[&'a str]>>,
     /// `(project, inputs)` pairs whose closure files are already in `owned`.
     prepared: HashSet<(&'a str, &'a [String])>,
@@ -622,10 +1027,10 @@ impl<'a> Plan<'a> {
         Plan {
             ws,
             patterns: HashMap::new(),
-            outputs: HashMap::new(),
             owned: HashMap::new(),
             shared: HashMap::new(),
             implicit: HashMap::new(),
+            workspace_inputs: None,
             closures: HashMap::new(),
             prepared: HashSet::new(),
         }
@@ -652,24 +1057,11 @@ impl<'a> Plan<'a> {
         })
     }
 
-    /// The union of every target's `outputs` in `project`.
-    fn outputs(&mut self, project: &'a Project) -> Result<Rc<Patterns>> {
-        memo(&mut self.outputs, project.name.as_str(), || {
-            let globs: Vec<String> = project
-                .targets
-                .values()
-                .flat_map(|t| t.outputs.iter().cloned())
-                .collect();
-            Patterns::new(&globs).map(Rc::new)
-        })
-    }
-
     /// Files `project` owns that match the project-relative globs, plus literal globs
-    /// naming existing files even if gitignored, minus the project's outputs. Only owned
-    /// files, so a project at the workspace root never sees its nested projects' files.
+    /// naming existing files even if gitignored. Only owned files, so a project at the
+    /// workspace root never sees its nested projects' files.
     fn owned(&mut self, project: &'a Project, inputs: &'a [String]) -> Result<Rc<[PathBuf]>> {
         let patterns = self.patterns(inputs)?;
-        let outputs = self.outputs(project)?;
         let ws = self.ws;
         memo(&mut self.owned, (project.name.as_str(), inputs), || {
             let root = &project.root;
@@ -687,11 +1079,6 @@ impl<'a> Plan<'a> {
                 .filter(|path| exists(&ws.root, path));
             Ok(globbed
                 .chain(literal)
-                .filter(|f| {
-                    !(f.strip_prefix(root)
-                        .is_ok_and(|rel| outputs.matches_project(rel))
-                        || outputs.matches_workspace(f))
-                })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect())
@@ -704,41 +1091,34 @@ impl<'a> Plan<'a> {
         let patterns = self.patterns(inputs)?;
         let ws = self.ws;
         memo(&mut self.shared, inputs, || {
-            if !patterns.has_workspace_globs() {
-                return Ok(Rc::from([]));
-            }
-            let literal = patterns
-                .workspace_literals()
-                .filter_map(|glob| files::normalize(Path::new(glob)))
-                .filter(|path| exists(&ws.root, path));
-            Ok(ws
-                .files
-                .iter()
-                .filter(|f| patterns.matches_workspace(f))
-                .cloned()
-                .chain(literal)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect())
+            Ok(workspace_matches(ws, &patterns).into())
         })
     }
 
-    /// Lockfiles, workspace manifests and toolchain files for the project's kinds (all of
-    /// them for explicit projects, which may run anything), plus its own manifests. No
+    fn workspace_inputs(&mut self) -> Result<Rc<WorkspaceInputs>> {
+        match &self.workspace_inputs {
+            Some(inputs) => Ok(inputs.clone()),
+            None => Ok(self
+                .workspace_inputs
+                .insert(Rc::new(WorkspaceInputs::resolve(self.ws)?))
+                .clone()),
+        }
+    }
+
+    /// Lockfiles, workspace manifests, toolchain files and tool configs for the project's
+    /// kinds (all of them for explicit projects, which may run anything), `[workspace]
+    /// inputs`, and the project's own manifests and root `tsconfig*.json` files. No
     /// `inputs` list can drop these; missing ones hash as `missing`.
-    fn implicit(&mut self, project: &'a Project) -> Rc<[PathBuf]> {
-        self.implicit
-            .entry(project.name.as_str())
-            .or_insert_with(|| {
+    fn implicit(&mut self, project: &'a Project) -> Result<Rc<[PathBuf]>> {
+        let workspace = self.workspace_inputs()?;
+        memo(&mut self.implicit, project.name.as_str(), || {
+            Ok({
                 let kinds = &project.kinds;
                 let uses = |kind: &Kind| kinds.contains(kind) || kinds.contains(&Kind::Explicit);
-                let workspace = [
-                    (Kind::Cargo, &CARGO_WORKSPACE_FILES[..]),
-                    (Kind::Js, &JS_WORKSPACE_FILES[..]),
-                ]
-                .into_iter()
-                .filter(|(kind, _)| uses(kind))
-                .flat_map(|(_, files)| files.iter().map(PathBuf::from));
+                let ecosystems = [(Kind::Cargo, &workspace.cargo), (Kind::Js, &workspace.js)]
+                    .into_iter()
+                    .filter(|(kind, _)| uses(kind))
+                    .flat_map(|(_, files)| files.iter().cloned());
                 let manifests = [(Kind::Js, "package.json"), (Kind::Cargo, "Cargo.toml")]
                     .into_iter()
                     .map(|(kind, name)| (kind, project.root.join(name)))
@@ -746,13 +1126,24 @@ impl<'a> Plan<'a> {
                         kinds.contains(kind) || project.files.binary_search(path).is_ok()
                     })
                     .map(|(_, path)| path);
-                workspace
+                let tsconfigs = project.files.iter().filter(|file| {
+                    file.parent() == Some(project.root.as_path())
+                        && file
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("tsconfig") && name.ends_with(".json")
+                            })
+                });
+                ecosystems
+                    .chain(workspace.every.iter().cloned())
                     .chain(manifests)
+                    .chain(tsconfigs.cloned())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect()
             })
-            .clone()
+        })
     }
 
     fn closure(&mut self, name: &'a str) -> Rc<[&'a str]> {
@@ -789,7 +1180,7 @@ impl<'a> Plan<'a> {
             .flat_map(|names| names.iter())
             .try_for_each(|dep| {
                 let dep = &ws.projects[*dep];
-                self.implicit(dep);
+                self.implicit(dep)?;
                 self.owned(dep, &target.inputs).map(drop)
             })?;
         Ok(TaskInputs {
@@ -797,7 +1188,7 @@ impl<'a> Plan<'a> {
             project,
             target,
             own: self.own_inputs(project, &target.inputs)?,
-            implicit: self.implicit(project),
+            implicit: self.implicit(project)?,
             closure,
         })
     }
@@ -1275,7 +1666,7 @@ command = "make a"
     }
 
     #[test]
-    fn unseen_entries_are_pruned_on_save() {
+    fn only_entries_for_vanished_paths_are_pruned() {
         let dir = tempfile::tempdir().unwrap();
         for f in ["a.txt", "b.txt"] {
             write(dir.path(), f, f);
@@ -1285,11 +1676,56 @@ command = "make a"
         cache.hash(dir.path(), Path::new("a.txt")).unwrap();
         cache.hash(dir.path(), Path::new("b.txt")).unwrap();
         cache.save(dir.path()).unwrap();
-        let mut second = FileHashCache::load(dir.path());
-        second.hash(dir.path(), Path::new("a.txt")).unwrap();
-        second.save(dir.path()).unwrap();
-        let third = FileHashCache::load(dir.path());
-        assert_eq!(third.entries.keys().collect::<Vec<_>>(), ["a.txt"]);
+        let entries = || {
+            FileHashCache::load(dir.path())
+                .entries
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+
+        let mut filtered = FileHashCache::load(dir.path());
+        filtered.hash(dir.path(), Path::new("a.txt")).unwrap();
+        filtered.save(dir.path()).unwrap();
+        assert_eq!(entries(), ["a.txt", "b.txt"], "a filtered run keeps b");
+
+        fs::remove_file(dir.path().join("b.txt")).unwrap();
+        let mut after_delete = FileHashCache::load(dir.path());
+        after_delete.hash(dir.path(), Path::new("a.txt")).unwrap();
+        after_delete.save(dir.path()).unwrap();
+        assert_eq!(entries(), ["a.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_smallest_failing_path_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "axonal.toml",
+            "[projects.\"libs/a\".targets.build]\ncommand = \"make\"\n",
+        );
+        let names: Vec<String> = (0..16).map(|i| format!("libs/a/f{i:02}.txt")).collect();
+        names.iter().for_each(|f| write(dir.path(), f, f));
+        let ws = Workspace::discover(dir.path()).unwrap();
+        names.iter().rev().for_each(|f| {
+            fs::set_permissions(dir.path().join(f), fs::Permissions::from_mode(0o000)).unwrap()
+        });
+        if fs::read(dir.path().join(&names[0])).is_ok() {
+            return; // running as root
+        }
+        let graph = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        for _ in 0..5 {
+            let err = task_keys(
+                &ws,
+                &graph,
+                &mut FileHashCache::default(),
+                &Toolchain::default(),
+                &no_env,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("libs/a/f00.txt"), "{err}");
+        }
     }
 
     #[cfg(unix)]
@@ -1311,30 +1747,588 @@ command = "make a"
     }
 
     #[test]
-    fn declared_outputs_do_not_change_keys() {
+    fn committed_outputs_are_still_inputs() {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
             "axonal.toml",
-            &format!(
-                "{ONE}\n[projects.\"apps/b\"]\ndeps = [\"libs/a\"]\n\n[projects.\"apps/b\".targets.build]\ncommand = \"make\"\n"
-            ),
+            r#"
+[projects."libs/a".targets.build]
+command = "tsc"
+
+[projects."libs/a".targets.codegen]
+command = "gen"
+outputs = ["src/gen/**"]
+
+[projects."libs/a".targets."lint-fix"]
+command = "eslint --fix ."
+outputs = ["src/**"]
+
+[projects."apps/b"]
+deps = ["libs/a"]
+
+[projects."apps/b".targets.build]
+command = "tsc"
+"#,
         );
-        write(dir.path(), "libs/a/src/a.txt", "a");
-        write(dir.path(), "apps/b/src/b.txt", "b");
-        let before = (
+        write(dir.path(), "libs/a/src/main.ts", "1");
+        write(dir.path(), "libs/a/src/gen/api.ts", "1");
+        write(dir.path(), "apps/b/src/b.ts", "b");
+        let keys = || {
+            ["build", "lint-fix"]
+                .map(|t| key_of(dir.path(), t, "libs/a"))
+                .into_iter()
+                .chain([key_of(dir.path(), "build", "apps/b")])
+                .collect::<Vec<_>>()
+        };
+        let k0 = keys();
+        write(dir.path(), "libs/a/src/gen/api.ts", "hand edit");
+        let k1 = keys();
+        write(dir.path(), "libs/a/src/main.ts", "2");
+        let k2 = keys();
+        for i in 0..3 {
+            assert_ne!(k0[i], k1[i], "editing src/gen/api.ts changes key {i}");
+            assert_ne!(k1[i], k2[i], "editing src/main.ts changes key {i}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_inside_symlinked_directories_change_keys() {
+        use std::os::unix::fs::symlink;
+        let dir = one_project();
+        write(dir.path(), "shared/util.ts", "export const x = 1");
+        write(dir.path(), "shared/node_modules/dep/index.js", "1");
+        symlink(".", dir.path().join("shared/loop")).unwrap();
+        symlink("../../../shared", dir.path().join("libs/a/src/shared")).unwrap();
+        let before = key_of(dir.path(), "build", "libs/a");
+        write(dir.path(), "shared/node_modules/dep/index.js", "2");
+        assert_eq!(
             key_of(dir.path(), "build", "libs/a"),
-            key_of(dir.path(), "build", "apps/b"),
+            before,
+            "node_modules is skipped"
         );
-        write(dir.path(), "libs/a/out/bundle.js", "built at 12:00");
-        let after = (
-            key_of(dir.path(), "build", "libs/a"),
-            key_of(dir.path(), "build", "apps/b"),
+        write(dir.path(), "shared/util.ts", "export const x = 2");
+        let edited = key_of(dir.path(), "build", "libs/a");
+        assert_ne!(edited, before);
+        write(dir.path(), "shared/nested/new.ts", "");
+        assert_ne!(key_of(dir.path(), "build", "libs/a"), edited);
+    }
+
+    #[cfg(unix)]
+    fn warm_key(root: &Path, project: &str) -> String {
+        let ws = Workspace::discover(root).unwrap();
+        let graph = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        let mut cache = FileHashCache::load(root);
+        let keys = task_keys(&ws, &graph, &mut cache, &Toolchain::default(), &no_env).unwrap();
+        cache.save(root).unwrap();
+        keys[&TaskId::new(project, "build")].0.clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_runs_reuse_stamps_behind_workspace_directory_links() {
+        let dir = one_project();
+        let root = dir.path();
+        write(root, "assets/data.txt", "data");
+        set_mtime(
+            &root.join("assets/data.txt"),
+            SystemTime::now() - Duration::from_secs(60),
+        );
+        std::os::unix::fs::symlink("../../../assets", root.join("libs/a/src/assets")).unwrap();
+        let cold = warm_key(root, "libs/a");
+        let path = root.join(FILE_HASHES);
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let stamp = &mut disk["entries"]["libs/a/src/assets/data.txt"]["hash"];
+        assert!(
+            stamp.is_string(),
+            "files behind the link are stamped: {disk}"
+        );
+        *stamp = "0".repeat(64).into();
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert_ne!(
+            warm_key(root, "libs/a"),
+            cold,
+            "the tampered stamp was reused, not rehashed"
+        );
+        assert_eq!(key_of(root, "build", "libs/a"), cold);
+    }
+
+    /// Applies each edit in turn, asserting it changes `libs/a`'s build key (or, unless
+    /// `changes`, that it doesn't).
+    #[cfg(unix)]
+    fn assert_edits(root: &Path, changes: bool, edits: &[(&str, &str)]) {
+        edits
+            .iter()
+            .fold(key_of(root, "build", "libs/a"), |before, (file, body)| {
+                write(root, file, body);
+                let after = key_of(root, "build", "libs/a");
+                assert_eq!(before != after, changes, "{file}");
+                after
+            });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_to_ignored_workspace_dirs_hash_everything_behind_them() {
+        let dir = one_project();
+        let root = dir.path();
+        write(root, ".gitignore", "target/\n");
+        write(root, "target/wasm-pkg/pkg.js", "v1");
+        write(root, "target/wasm-pkg/.hidden", "v1");
+        std::os::unix::fs::symlink("../../../target/wasm-pkg", root.join("libs/a/src/linked"))
+            .unwrap();
+        assert_edits(
+            root,
+            true,
+            &[
+                ("target/wasm-pkg/pkg.js", "v2"),
+                ("target/wasm-pkg/new.js", "added"),
+                ("target/wasm-pkg/sub/deep.js", "added"),
+                ("target/wasm-pkg/.hidden", "v2"),
+            ],
+        );
+        assert_edits(
+            root,
+            false,
+            &[
+                ("target/wasm-pkg/node_modules/x.js", "skipped"),
+                ("target/wasm-pkg/.git/HEAD", "skipped"),
+                ("target/wasm-pkg/.axonal/filehash.json", "skipped"),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_into_node_modules_hash_their_target() {
+        let dir = one_project();
+        let root = dir.path();
+        write(root, "node_modules/pdfjs/build/pdf.js", "v1");
+        std::os::unix::fs::symlink(
+            "../../../node_modules/pdfjs/build",
+            root.join("libs/a/src/pdfjs"),
+        )
+        .unwrap();
+        assert_edits(
+            root,
+            true,
+            &[
+                ("node_modules/pdfjs/build/pdf.js", "v2"),
+                ("node_modules/pdfjs/build/worker.js", "added"),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_directory_links_hash_ignored_files() {
+        let dir = one_project();
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), ".gitignore", "dist/\n");
+        write(outside.path(), "src/x.ts", "x");
+        write(outside.path(), "dist/x.js", "built 1");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("libs/a/src/ext")).unwrap();
+        let outside_files = |rels: &[&str]| -> Vec<String> {
+            rels.iter()
+                .map(|rel| outside.path().join(rel).to_str().unwrap().to_string())
+                .collect()
+        };
+        let changing = outside_files(&["dist/x.js", "dist/new.js", "src/x.ts"]);
+        let skipped = outside_files(&[".axonal/filehash.json", "node_modules/m/i.js"]);
+        let changing: Vec<(&str, &str)> = changing.iter().map(|f| (f.as_str(), "2")).collect();
+        let skipped: Vec<(&str, &str)> = skipped.iter().map(|f| (f.as_str(), "2")).collect();
+        assert_edits(dir.path(), true, &changing);
+        assert_edits(dir.path(), false, &skipped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_directory_links_are_followed() {
+        let dir = one_project();
+        let root = dir.path();
+        write(root, "shared/x.ts", "x");
+        write(root, "assets/img.txt", "1");
+        std::os::unix::fs::symlink("../assets", root.join("shared/assets")).unwrap();
+        std::os::unix::fs::symlink("../../../shared", root.join("libs/a/src/shared")).unwrap();
+        assert_edits(
+            root,
+            true,
+            &[("assets/img.txt", "2"), ("assets/more/new.txt", "added")],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_link_loops_terminate() {
+        use std::os::unix::fs::symlink;
+        let dir = one_project();
+        let root = dir.path();
+        write(root, "shared/a/x.ts", "x");
+        write(root, "shared/b/y.ts", "y");
+        symlink("..", root.join("shared/a/up")).unwrap();
+        symlink("../b", root.join("shared/a/b")).unwrap();
+        symlink("../a", root.join("shared/b/a")).unwrap();
+        symlink("../../../shared", root.join("libs/a/src/shared")).unwrap();
+        assert_edits(
+            root,
+            true,
+            &[("shared/a/x.ts", "2"), ("shared/b/y.ts", "2")],
+        );
+    }
+
+    /// `f`'s result, or `None` if it hasn't finished after 1.5 s.
+    #[cfg(unix)]
+    fn prompt<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_millis(1500)).ok()
+    }
+
+    /// Hashes `rel` as the regular file `meta` (its earlier `lstat`) says it is:
+    /// the digest and whether a stamp would be stored.
+    #[cfg(unix)]
+    fn regular_after_lstat(root: &Path, rel: &str, meta: Metadata) -> Option<(String, bool)> {
+        let root = fs::canonicalize(root).unwrap();
+        let rel = PathBuf::from(rel);
+        prompt(move || {
+            match FileHashCache::default()
+                .regular(&root, &rel, &meta, Follow::Directories)
+                .unwrap()
+            {
+                Computed::Hashed(h) => (h.digest, h.stamp.is_some()),
+                Computed::DirLink { .. } => panic!("not a directory link"),
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_to_devices_hash_promptly_without_being_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("zero");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        let followed = link.clone();
+        assert!(matches!(
+            prompt(move || open_regular(&followed, true).map(|f| f.is_some())),
+            Some(Ok(false))
+        ));
+        assert!(matches!(
+            prompt(move || open_regular(&link, false).map(|f| f.is_some())),
+            Some(Err(_))
+        ));
+        let root = dir.path().to_path_buf();
+        let digest = prompt(move || {
+            FileHashCache::default()
+                .hash(&root, Path::new("zero"))
+                .unwrap()
+        });
+        assert!(digest.is_some_and(|d| d.starts_with("link:")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_swapped_for_device_links_after_lstat_hash_as_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "f", "regular");
+        let meta = fs::symlink_metadata(root.join("f")).unwrap();
+        fs::remove_file(root.join("f")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", root.join("f")).unwrap();
+        let link = FileHashCache::default().hash(root, Path::new("f")).unwrap();
+        assert_eq!(regular_after_lstat(root, "f", meta), Some((link, false)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_swapped_for_fifos_after_lstat_hash_as_special() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "f", "regular");
+        let meta = fs::symlink_metadata(root.join("f")).unwrap();
+        fs::remove_file(root.join("f")).unwrap();
+        assert!(
+            Command::new("mkfifo")
+                .arg(root.join("f"))
+                .status()
+                .unwrap()
+                .success()
         );
         assert_eq!(
-            before, after,
-            "outputs are not inputs, here or in dependents"
+            regular_after_lstat(root, "f", meta),
+            Some((SPECIAL.into(), false))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_replaced_after_lstat_are_hashed_but_not_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "f", "one");
+        set_mtime(&root.join("f"), SystemTime::now() - Duration::from_secs(60));
+        let meta = fs::symlink_metadata(root.join("f")).unwrap();
+        assert!(regular_after_lstat(root, "f", meta.clone()).is_some_and(|(_, stamped)| stamped));
+        write(root, "g", "two");
+        set_mtime(&root.join("g"), SystemTime::now() - Duration::from_secs(60));
+        fs::rename(root.join("g"), root.join("f")).unwrap();
+        let two = FileHashCache::default().hash(root, Path::new("f")).unwrap();
+        assert_eq!(regular_after_lstat(root, "f", meta), Some((two, false)));
+    }
+
+    /// Runs `f` on a thread; true if it hasn't finished after 1.5 s, in which case
+    /// `unblock` runs so `f` can finish.
+    #[cfg(unix)]
+    fn hangs(f: impl FnOnce() + Send + 'static, unblock: impl FnOnce()) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        let hung = rx.recv_timeout(Duration::from_millis(1500)).is_err();
+        if hung {
+            unblock();
+        }
+        hung
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_inputs_hash_as_special_without_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(
+            &root,
+            "axonal.toml",
+            "[projects.\"libs/a\".targets.build]\ncommand = \"m\"\ninputs = [\"src/**\", \"pipe\", \"via-link\"]\n",
+        );
+        write(&root, "libs/a/src/a.txt", "a");
+        let fifo = root.join("libs/a/pipe");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::os::unix::fs::symlink("pipe", root.join("libs/a/via-link")).unwrap();
+        let r = root.clone();
+        let hung = hangs(
+            move || {
+                key_of(&r, "build", "libs/a");
+            },
+            || {
+                let _ = fs::OpenOptions::new().write(true).open(&fifo);
+            },
+        );
+        assert!(!hung, "hashing a FIFO must not block");
+        let mut cache = FileHashCache::default();
+        assert_eq!(
+            cache.hash(&root, Path::new("libs/a/pipe")).unwrap(),
+            SPECIAL
+        );
+        assert_ne!(
+            cache.hash(&root, Path::new("libs/a/via-link")).unwrap(),
+            MISSING
+        );
+    }
+
+    fn all_keys(ws: &Workspace, graph: &TaskGraph) -> BTreeMap<TaskId, Key> {
+        task_keys(
+            ws,
+            graph,
+            &mut FileHashCache::default(),
+            &Toolchain::default(),
+            &no_env,
+        )
+        .unwrap()
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    const TARGETS: [&str; 4] = ["build", "test", "lint", "fmt"];
+
+    /// `n` explicit projects with random deps and targets, outputs, gitignored literal
+    /// inputs and a `{workspace}/` input.
+    fn random_workspace(n: usize, seed: u64) -> tempfile::TempDir {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rng = Lcg(seed);
+        let mut config = String::from(
+            r#"
+[targets.build]
+depends_on = ["^build"]
+outputs = ["dist/**"]
+
+[targets.test]
+inputs = ["src/**", "test/**", ".env.local"]
+
+[targets.lint]
+inputs = ["src/**", "{workspace}/eslint.cfg"]
+
+[targets.fmt]
+inputs = ["src/**"]
+"#,
+        );
+        for i in 0..n {
+            let deps: Vec<String> = (0..i)
+                .filter(|_| rng.next().is_multiple_of(5))
+                .map(|d| format!("\"p{d:02}\""))
+                .collect();
+            writeln!(config, "[projects.p{i:02}]\ndeps = [{}]\n", deps.join(", ")).unwrap();
+            for t in TARGETS {
+                if t == "build" || !rng.next().is_multiple_of(3) {
+                    writeln!(
+                        config,
+                        "[projects.p{i:02}.targets.{t}]\ncommand = \"{t} {i}\"\n"
+                    )
+                    .unwrap();
+                }
+            }
+            write(dir.path(), &format!("p{i:02}/src/m.ts"), &format!("{i}"));
+            if rng.next().is_multiple_of(2) {
+                write(dir.path(), &format!("p{i:02}/test/t.ts"), "t");
+            }
+            write(dir.path(), &format!("p{i:02}/README.md"), "r");
+            write(dir.path(), &format!("p{i:02}/dist/out.js"), "o");
+            if rng.next().is_multiple_of(4) {
+                write(dir.path(), &format!("p{i:02}/.env.local"), "e");
+            }
+        }
+        write(dir.path(), ".gitignore", ".env.local\n");
+        write(dir.path(), "eslint.cfg", "rules");
+        write(dir.path(), "pnpm-lock.yaml", "l");
+        write(dir.path(), "axonal.toml", &config);
+        dir
+    }
+
+    fn every_target(ws: &Workspace) -> TaskGraph {
+        TaskGraph::build(ws, &TARGETS.map(String::from), None).unwrap()
+    }
+
+    #[test]
+    fn memo_single_root_graphs_match_full_graph() {
+        for seed in 1..=5 {
+            let dir = random_workspace(30, seed);
+            let ws = Workspace::discover(dir.path()).unwrap();
+            let graph = every_target(&ws);
+            let full = all_keys(&ws, &graph);
+            for id in &graph.order {
+                let single = TaskGraph::from_roots(&ws, vec![id.clone()]).unwrap();
+                assert_eq!(all_keys(&ws, &single)[id], full[id], "seed {seed} {id}");
+            }
+        }
+    }
+
+    /// The files a task's key should cover, computed per task with fresh memos.
+    fn reference_files(ws: &Workspace, id: &TaskId) -> BTreeSet<PathBuf> {
+        let project = &ws.projects[&id.project];
+        let target = ws.target(id);
+        let mut plan = Plan::new(ws);
+        let own = plan.own_inputs(project, &target.inputs).unwrap();
+        let implicit = plan.implicit(project).unwrap();
+        let deps = (target.deps_usage != DepsUsage::None)
+            .then(|| ws.dependency_closure(&project.name))
+            .into_iter()
+            .flatten()
+            .flat_map(|dep| {
+                let dep = &ws.projects[dep];
+                let mut fresh = Plan::new(ws);
+                let owned = fresh.owned(dep, &target.inputs).unwrap();
+                let implicit = fresh.implicit(dep).unwrap();
+                owned
+                    .iter()
+                    .chain(implicit.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+        own.into_iter()
+            .chain(implicit.iter().cloned())
+            .chain(deps)
+            .collect()
+    }
+
+    #[test]
+    fn memo_file_edits_change_exactly_the_expected_keys_seed_7() {
+        file_edits_change_exactly_the_expected_keys(7);
+    }
+
+    #[test]
+    fn memo_file_edits_change_exactly_the_expected_keys_seed_8() {
+        file_edits_change_exactly_the_expected_keys(8);
+    }
+
+    fn file_edits_change_exactly_the_expected_keys(seed: u64) {
+        let dir = random_workspace(25, seed);
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let graph = every_target(&ws);
+        let base = all_keys(&ws, &graph);
+        let refs: BTreeMap<&TaskId, BTreeSet<PathBuf>> = graph
+            .order
+            .iter()
+            .map(|id| (id, reference_files(&ws, id)))
+            .collect();
+        let candidates: BTreeSet<PathBuf> = ws
+            .files
+            .iter()
+            .cloned()
+            .chain(refs.values().flatten().cloned())
+            .filter(|f| dir.path().join(f).is_file())
+            .collect();
+        for file in &candidates {
+            let abs = dir.path().join(file);
+            let original = fs::read(&abs).unwrap();
+            fs::write(&abs, [original.as_slice(), b"!"].concat()).unwrap();
+            let edited = all_keys(&ws, &graph);
+            fs::write(&abs, &original).unwrap();
+            let expected = graph.order.iter().fold(BTreeSet::new(), |mut hit, id| {
+                if refs[id].contains(file) || graph.deps[id].iter().any(|d| hit.contains(d)) {
+                    hit.insert(id);
+                }
+                hit
+            });
+            let changed: BTreeSet<&TaskId> = graph
+                .order
+                .iter()
+                .filter(|id| base[*id] != edited[*id])
+                .collect();
+            assert_eq!(changed, expected, "seed {seed} file {}", file.display());
+        }
+        assert!(candidates.len() > 50, "{}", candidates.len());
+        assert_eq!(all_keys(&ws, &graph), base);
+    }
+
+    #[test]
+    fn keys_do_not_depend_on_the_thread_count() {
+        let dir = random_workspace(40, 11);
+        let ws = Workspace::discover(dir.path()).unwrap();
+        let graph = every_target(&ws);
+        let with = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| all_keys(&ws, &graph))
+        };
+        let one = with(1);
+        for threads in [2, 8, 16] {
+            for _ in 0..5 {
+                assert_eq!(with(threads), one, "{threads} threads");
+            }
+        }
     }
 
     #[test]
@@ -1448,6 +2442,144 @@ command = "make a"
     }
 
     #[test]
+    fn root_js_tool_configs_change_pnpm_member_keys() {
+        let dir = mixed_workspace();
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{"extends":"./configs/base"}"#,
+        );
+        write(
+            dir.path(),
+            "configs/base.json",
+            r#"{"compilerOptions":{"strict":false}}"#,
+        );
+        let edits = [
+            (
+                "configs/base.json",
+                r#"{"compilerOptions":{"strict":true}}"#,
+            ),
+            ("tsconfig.base.json", "{}"),
+            ("eslint.config.js", "export default []"),
+            (".eslintrc.json", "{}"),
+            (".prettierrc", "{}"),
+            ("prettier.config.mjs", "export default {}"),
+            ("biome.json", "{}"),
+            ("biome.jsonc", "{}"),
+        ];
+        let c = key_of(dir.path(), "build", "c");
+        edits
+            .iter()
+            .fold(key_of(dir.path(), "build", "p"), |before, (file, body)| {
+                write(dir.path(), file, body);
+                let after = key_of(dir.path(), "build", "p");
+                assert_ne!(before, after, "{file}");
+                after
+            });
+        assert_eq!(
+            key_of(dir.path(), "build", "c"),
+            c,
+            "JS configs aren't Cargo inputs"
+        );
+    }
+
+    #[test]
+    fn project_tsconfigs_change_keys_whatever_the_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+        write(
+            root,
+            "packages/p/package.json",
+            r#"{"name":"p","scripts":{"typecheck":"tsc"}}"#,
+        );
+        write(root, "packages/p/src/index.ts", "");
+        write(
+            root,
+            "packages/p/tsconfig.json",
+            r#"{"compilerOptions":{}}"#,
+        );
+        write(root, "packages/p/tsconfig.build.json", "{}");
+        write(root, "packages/p/docs/tsconfig.json", "{}");
+        write(
+            root,
+            "axonal.toml",
+            "[projects.\"packages/p\".targets.typecheck]\ninputs = [\"src/**\"]\n",
+        );
+        let k0 = key_of(root, "typecheck", "p");
+        write(
+            root,
+            "packages/p/tsconfig.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        );
+        let k1 = key_of(root, "typecheck", "p");
+        assert_ne!(k0, k1);
+        write(
+            root,
+            "packages/p/tsconfig.build.json",
+            r#"{"extends":"./tsconfig.json"}"#,
+        );
+        let k2 = key_of(root, "typecheck", "p");
+        assert_ne!(k1, k2);
+        write(root, "packages/p/docs/tsconfig.json", r#"{"x":1}"#);
+        assert_eq!(
+            key_of(root, "typecheck", "p"),
+            k2,
+            "only the project root's"
+        );
+    }
+
+    #[test]
+    fn root_rust_tool_configs_change_cargo_member_keys() {
+        let dir = mixed_workspace();
+        let p = key_of(dir.path(), "build", "p");
+        [
+            "rustfmt.toml",
+            ".rustfmt.toml",
+            "clippy.toml",
+            ".clippy.toml",
+        ]
+        .iter()
+        .fold(key_of(dir.path(), "build", "c"), |before, file| {
+            write(dir.path(), file, "max_width = 80\n");
+            let after = key_of(dir.path(), "build", "c");
+            assert_ne!(before, after, "{file}");
+            after
+        });
+        assert_eq!(
+            key_of(dir.path(), "build", "p"),
+            p,
+            "Rust configs aren't JS inputs"
+        );
+    }
+
+    #[test]
+    fn configured_workspace_inputs_change_every_key() {
+        let dir = fixture();
+        write(
+            dir.path(),
+            "axonal.toml",
+            &format!("[workspace]\ninputs = [\".tool-versions\", \"ci/*.env\"]\n{CONFIG}"),
+        );
+        write(dir.path(), ".gitignore", ".tool-versions\n");
+        write(dir.path(), ".tool-versions", "node 24");
+        write(dir.path(), "ci/prod.env", "A=1");
+        let every = || {
+            [("build", "libs/a"), ("build", "apps/b"), ("fmt", "apps/b")]
+                .map(|(target, project)| key_of(dir.path(), target, project))
+        };
+        let k0 = every();
+        write(dir.path(), ".tool-versions", "node 26");
+        let k1 = every();
+        write(dir.path(), "ci/prod.env", "A=2");
+        let k2 = every();
+        for i in 0..3 {
+            assert_ne!(k0[i], k1[i], "gitignored literal, key {i}");
+            assert_ne!(k1[i], k2[i], "glob, key {i}");
+        }
+    }
+
+    #[test]
     fn missing_tools_probe_as_missing() {
         let probes = [Probe {
             name: "nope",
@@ -1499,8 +2631,136 @@ command = "make a"
             "{:?}",
             start.elapsed()
         );
-        assert_eq!(versions["slow"], "timeout");
-        assert_eq!(versions["also_slow"], "timeout");
+        assert_eq!(versions["slow"], identity_of("sleep"));
+        assert_eq!(versions["also_slow"], identity_of("sleep"));
+    }
+
+    /// What a probe of `program` that times out hashes as.
+    #[cfg(unix)]
+    fn identity_of(program: &str) -> String {
+        let identity =
+            binary_identity(Path::new("/"), program, std::env::var_os("PATH").as_deref());
+        assert!(identity.starts_with("timeout:"), "{program}: {identity}");
+        identity
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_tools_are_identified_by_their_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let bins = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let tool = |dir: &tempfile::TempDir, body: &str| {
+            let path = dir.path().join("tool");
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            &*String::leak(path.to_str().unwrap().to_string())
+        };
+        let (v1, v2) = (
+            tool(&bins[0], "#!/bin/sh\nsleep 5\n"),
+            tool(&bins[1], "#!/bin/sh\n# v2\nsleep 5\n"),
+        );
+        let probes = [("one", v1), ("two", v2), ("one_again", v1)].map(|(name, program)| Probe {
+            name,
+            program,
+            args: &[],
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let versions = run_probes(dir.path(), &probes, Duration::from_millis(300));
+        assert!(versions["one"].starts_with("timeout:"), "{versions:?}");
+        assert_ne!(versions["one"], versions["two"]);
+        assert_eq!(versions["one"], versions["one_again"]);
+        let toolchain = |version: &str| Toolchain {
+            versions: BTreeMap::from([("node", version.to_string())]),
+        };
+        let js = BTreeSet::from([Kind::Js]);
+        assert_ne!(
+            toolchain(&versions["one"]).relevant(&js),
+            toolchain(&versions["two"]).relevant(&js)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn programs_resolve_to_the_first_executable_on_the_search_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a/tool", "not executable");
+        write(dir.path(), "b/tool", "#!/bin/sh\n");
+        write(dir.path(), "c/tool", "#!/bin/sh\n");
+        ["b/tool", "c/tool"].iter().for_each(|tool| {
+            fs::set_permissions(dir.path().join(tool), fs::Permissions::from_mode(0o755)).unwrap();
+        });
+        let search =
+            std::env::join_paths([dir.path().join("a"), "b".into(), dir.path().join("c")]).unwrap();
+        assert_eq!(
+            find_program(dir.path(), "tool", Some(&search)),
+            Some(dir.path().join("b/tool"))
+        );
+        assert_eq!(
+            find_program(dir.path(), "./c/tool", None),
+            Some(dir.path().join("./c/tool"))
+        );
+        assert_eq!(find_program(dir.path(), "nope", Some(&search)), None);
+        assert_eq!(
+            binary_identity(dir.path(), "nope", Some(&search)),
+            "missing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grandchildren_holding_stdout_open_cannot_outlast_the_deadline() {
+        let probes = [Probe {
+            name: "forks",
+            program: "sh",
+            args: &["-c", "(sleep 4) & echo 1.0"],
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let versions = run_probes(dir.path(), &probes, Duration::from_millis(500));
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(versions["forks"], identity_of("sh"));
+    }
+
+    /// The grandchild leaves the probe's process group, so after the probe exits it
+    /// still holds stdout and the group kill can't reach it. The probe stays unreaped
+    /// until after the kill, so the kill can only hit the probe's own group; whether a
+    /// reaped pid would have been reused can't be observed reliably, so only the outcome
+    /// is checked.
+    #[cfg(unix)]
+    #[test]
+    fn grandchildren_escaping_the_group_cannot_outlast_the_deadline() {
+        if Command::new("perl")
+            .args(["-MPOSIX", "-e", "1"])
+            .status()
+            .is_err()
+        {
+            eprintln!("perl not found; skipped");
+            return;
+        }
+        let probes = [Probe {
+            name: "escapes",
+            program: "perl",
+            args: &[
+                "-MPOSIX",
+                "-e",
+                "if (fork() == 0) { POSIX::setsid(); open(my $f, '>', 'escaped.pid'); \
+                 print $f $$; close $f; sleep 4; exit 0 } print \"1.0\\n\";",
+            ],
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let versions = run_probes(dir.path(), &probes, Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        if let Ok(pid) = fs::read_to_string(dir.path().join("escaped.pid")) {
+            let _ = Command::new("kill").arg(pid.trim()).status();
+        }
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        assert_eq!(versions["escapes"], identity_of("perl"));
     }
 
     /// `cargo test --release hash::tests::scale -- --ignored --nocapture`; set
