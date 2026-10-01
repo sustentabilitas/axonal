@@ -49,6 +49,18 @@ fn run_affected_runs_only_affected_tasks() {
 }
 
 #[test]
+fn run_affected_with_a_head_still_runs_uncommitted_changes() {
+    let repo = Repo::fixture("scripts");
+    repo.feature(|r| r.write("libs/a/src/a.txt", "alpha2\n"));
+    repo.write("apps/c/src/c.txt", "charlie2\n");
+    let out = repo.stdout(&["run", "build", "--affected", "--head", "HEAD"]);
+    assert_eq!(
+        out.lines().last().unwrap(),
+        "3 tasks: 3 ran, 0 cache hits, 0 failed, 0 skipped"
+    );
+}
+
+#[test]
 fn explicit_range_and_json_causes() {
     let repo = Repo::fixture("scripts");
     let base = repo.git(&["rev-parse", "HEAD"]);

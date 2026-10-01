@@ -75,7 +75,8 @@ struct RunArgs {
     /// Base revision (default: merge-base with the default branch).
     #[arg(long, requires = "affected")]
     base: Option<String>,
-    /// Head revision (default: the working tree).
+    /// Head revision; changes in the working tree since the base are included as well,
+    /// since tasks run against it.
     #[arg(long, requires = "affected")]
     head: Option<String>,
     /// Maximum concurrent tasks (default: CPU cores).
@@ -159,9 +160,17 @@ fn run_command(root: &Path, args: RunArgs) -> anyhow::Result<u8> {
             ws.check_projects(names)?;
         }
         let range = Range::resolve(&ws, args.base.as_deref(), args.head.as_deref())?;
-        let affected = affected::from_git(&ws, &full, &range)?;
-        let roots = affected
-            .tasks
+        // Tasks run against the working tree, so its changes since the base count whatever
+        // `--head` names.
+        let worktree = Range {
+            head: None,
+            ..range.clone()
+        };
+        let mut tasks = affected::from_git(&ws, &full, &worktree)?.tasks;
+        if range.head.is_some() {
+            tasks.extend(affected::from_git(&ws, &full, &range)?.tasks);
+        }
+        let roots = tasks
             .keys()
             .filter(|id| args.targets.contains(&id.target))
             .filter(|id| selected.as_ref().is_none_or(|s| s.contains(&id.project)))
