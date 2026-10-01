@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, Seek, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::{Duration, SystemTime},
 };
@@ -58,11 +58,22 @@ fn thread_lock(dir: &Path) -> Arc<RwLock<()>> {
 }
 
 /// `path` with its deepest existing ancestor canonicalized, so it is the same before and
-/// after the rest is created.
+/// after the rest is created. The rest doesn't exist, so it holds no symlinks and its
+/// `..`s are resolved lexically.
 fn canonical(path: &Path) -> PathBuf {
     path.ancestors()
         .find_map(|a| Some((a, a.canonicalize().ok()?)))
-        .and_then(|(a, c)| Some(c.join(path.strip_prefix(a).ok()?)))
+        .and_then(|(a, c)| {
+            path.strip_prefix(a).ok().map(|rest| {
+                rest.components().fold(c, |acc, part| match part {
+                    Component::ParentDir => acc.tap_mut(|p| {
+                        p.pop();
+                    }),
+                    Component::CurDir => acc,
+                    part => acc.tap_mut(|p| p.push(part)),
+                })
+            })
+        })
         .unwrap_or_else(|| path.to_path_buf())
 }
 
@@ -749,6 +760,7 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("."),
             dir.path().canonicalize().unwrap(),
+            dir.path().join("missing/./.."),
         ];
         let before = spellings.each_ref().map(|root| Local::new(root));
         assert!(
