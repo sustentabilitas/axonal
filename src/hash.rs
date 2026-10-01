@@ -976,13 +976,6 @@ impl WorkspaceInputs {
                 && f.to_str()
                     .is_some_and(|name| JS_CONFIG_PREFIXES.iter().any(|p| name.starts_with(p)))
         });
-        let globs: Vec<String> = ws
-            .config
-            .workspace
-            .inputs
-            .iter()
-            .map(|glob| format!("{}{glob}", files::WORKSPACE_PREFIX))
-            .collect();
         Ok(WorkspaceInputs {
             cargo: CARGO_WORKSPACE_FILES.iter().map(PathBuf::from).collect(),
             js: JS_WORKSPACE_FILES
@@ -991,8 +984,58 @@ impl WorkspaceInputs {
                 .chain(ts::config_files(&ws.root))
                 .chain(js_configs.cloned())
                 .collect(),
-            every: workspace_matches(ws, &Patterns::new(&globs)?),
+            every: workspace_matches(ws, &workspace_input_patterns(ws)?),
         })
+    }
+}
+
+/// `[workspace] inputs` as `{workspace}/` patterns.
+fn workspace_input_patterns(ws: &Workspace) -> Result<Patterns> {
+    let globs: Vec<String> = ws
+        .config
+        .workspace
+        .inputs
+        .iter()
+        .map(|glob| format!("{}{glob}", files::WORKSPACE_PREFIX))
+        .collect();
+    Patterns::new(&globs)
+}
+
+fn is_tsconfig(name: &str) -> bool {
+    name.starts_with("tsconfig") && name.ends_with(".json")
+}
+
+/// Decides whether a workspace-relative path is an implicit input of a project's tasks,
+/// by the rules `task_keys` hashes them by, but by name, so deleted files count too.
+pub struct ImplicitInputs {
+    ts_configs: BTreeSet<PathBuf>,
+    every: Patterns,
+}
+
+impl ImplicitInputs {
+    pub fn new(ws: &Workspace) -> Result<ImplicitInputs> {
+        Ok(ImplicitInputs {
+            ts_configs: ts::config_files(&ws.root).into_iter().collect(),
+            every: workspace_input_patterns(ws)?,
+        })
+    }
+
+    pub fn applies(&self, project: &Project, path: &Path) -> bool {
+        let kinds = &project.kinds;
+        let uses = |kind: Kind| kinds.contains(&kind) || kinds.contains(&Kind::Explicit);
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+        let at_root = path.parent().is_some_and(|dir| dir.as_os_str().is_empty());
+        let listed = |list: &[&str]| list.iter().any(|f| path == Path::new(f));
+        let cargo = uses(Kind::Cargo) && listed(&CARGO_WORKSPACE_FILES);
+        let js = uses(Kind::Js)
+            && (listed(&JS_WORKSPACE_FILES)
+                || self.ts_configs.contains(path)
+                || at_root
+                    && (is_tsconfig(name)
+                        || JS_CONFIG_PREFIXES.iter().any(|p| name.starts_with(p))));
+        let own = path.parent() == Some(project.root.as_path())
+            && (name == "package.json" || name == "Cargo.toml" || is_tsconfig(name));
+        cargo || js || own || self.every.matches_workspace(path)
     }
 }
 
@@ -1131,9 +1174,7 @@ impl<'a> Plan<'a> {
                         && file
                             .file_name()
                             .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                name.starts_with("tsconfig") && name.ends_with(".json")
-                            })
+                            .is_some_and(is_tsconfig)
                 });
                 ecosystems
                     .chain(workspace.every.iter().cloned())
@@ -2259,6 +2300,56 @@ inputs = ["src/**"]
             .chain(implicit.iter().cloned())
             .chain(deps)
             .collect()
+    }
+
+    #[test]
+    fn implicit_input_rules_cover_every_implicitly_hashed_file() {
+        let random = random_workspace(30, 3);
+        let mixed = mixed_workspace();
+        write(
+            mixed.path(),
+            "tsconfig.json",
+            r#"{"extends":"./configs/base"}"#,
+        );
+        write(mixed.path(), "configs/base.json", "{}");
+        write(mixed.path(), ".eslintrc.json", "{}");
+        write(mixed.path(), "packages/p/tsconfig.build.json", "{}");
+        write(mixed.path(), "tools/gen.sh", "");
+        write(
+            mixed.path(),
+            "axonal.toml",
+            "[workspace]\ninputs = [\"tools/**\"]\n\n[projects.\"packages/p\".targets.build]\ninputs = [\"src/**\"]\n",
+        );
+        for dir in [&random, &mixed] {
+            let ws = Workspace::discover(dir.path()).unwrap();
+            let rules = ImplicitInputs::new(&ws).unwrap();
+            let mut plan = Plan::new(&ws);
+            let mut checked = 0;
+            for project in ws.projects.values() {
+                for path in plan.implicit(project).unwrap().iter() {
+                    assert!(
+                        rules.applies(project, path),
+                        "{}: {}",
+                        project.name,
+                        path.display()
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 10, "{checked}");
+        }
+        let ws = Workspace::discover(mixed.path()).unwrap();
+        let rules = ImplicitInputs::new(&ws).unwrap();
+        let (c, p) = (&ws.projects["c"], &ws.projects["p"]);
+        assert!(rules.applies(c, Path::new("tools/gen.sh")));
+        assert!(rules.applies(c, Path::new("rust-toolchain.toml")));
+        assert!(!rules.applies(p, Path::new("rust-toolchain.toml")));
+        assert!(
+            rules.applies(p, Path::new("prettier.config.mjs")),
+            "deleted files match by name"
+        );
+        assert!(!rules.applies(p, Path::new("packages/p/src/index.ts")));
+        assert!(!rules.applies(c, Path::new("packages/p/package.json")));
     }
 
     #[test]
