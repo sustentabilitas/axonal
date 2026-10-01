@@ -9,8 +9,24 @@ use std::{
 
 use crate::error::{Error, Result};
 
+/// Variables that point git at another repository; tests clear them so a hook running
+/// `cargo test` can't redirect the temp repos into the developer's.
+#[cfg(test)]
+pub(crate) const REPO_VARS: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+];
+
 fn output(dir: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    #[cfg(test)]
+    REPO_VARS.iter().for_each(|var| {
+        command.env_remove(var);
+    });
+    command
         .args(args)
         .current_dir(dir)
         .output()
@@ -52,7 +68,18 @@ pub fn rev_exists(dir: &Path, rev: &str) -> bool {
 }
 
 pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<String> {
-    git(dir, &["merge-base", a, b]).map(text)
+    let out = output(dir, &["merge-base", a, b])?;
+    match (out.status.success(), out.stderr.is_empty()) {
+        (true, _) => Ok(text(out.stdout)),
+        (false, true) => Err(Error::Git(format!(
+            "`{a}` and `{b}` have no common ancestor (a shallow clone?); \
+             fetch more history or pass --base"
+        ))),
+        (false, false) => Err(Error::Git(format!(
+            "`git merge-base {a} {b}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+    }
 }
 
 /// `merge-base(<branch>, head)`, falling back to `origin/<branch>`.
@@ -69,7 +96,8 @@ pub fn default_base(dir: &Path, branch: &str, head: &str) -> Result<String> {
 }
 
 /// Files changed between `base` and `head`; with no `head`, against the working tree,
-/// including untracked files. Deleted files are included.
+/// including untracked files not excluded by a `.gitignore` (as workspace listing, which
+/// ignores `.git/info/exclude` and the global excludes file). Deleted files are included.
 pub fn changed_files(dir: &Path, base: &str, head: Option<&str>) -> Result<BTreeSet<PathBuf>> {
     let mut args = vec![
         "diff",
@@ -84,7 +112,12 @@ pub fn changed_files(dir: &Path, base: &str, head: Option<&str>) -> Result<BTree
     if head.is_none() {
         files.extend(split_nul(&git(
             dir,
-            &["ls-files", "--others", "--exclude-standard", "-z"],
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-per-directory=.gitignore",
+                "-z",
+            ],
         )?));
     }
     Ok(files)
@@ -203,6 +236,32 @@ mod tests {
             changed_files(&ws, &base, None).unwrap(),
             BTreeSet::from([PathBuf::from("a.txt"), PathBuf::from("b.txt")])
         );
+    }
+
+    #[test]
+    fn untracked_files_follow_gitignore_but_not_info_exclude() {
+        let dir = repo();
+        let ws = dir.path().join("ws");
+        let base = sh(dir.path(), &["rev-parse", "HEAD"]);
+        fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        commit(dir.path(), "ignore");
+        fs::write(dir.path().join(".git/info/exclude"), "local.json\n").unwrap();
+        fs::write(ws.join("ignored.txt"), "x").unwrap();
+        fs::write(ws.join("local.json"), "x").unwrap();
+        assert_eq!(
+            changed_files(&ws, &base, None).unwrap(),
+            BTreeSet::from([PathBuf::from("local.json")])
+        );
+    }
+
+    #[test]
+    fn unrelated_histories_explain_the_missing_merge_base() {
+        let dir = repo();
+        sh(dir.path(), &["checkout", "-q", "--orphan", "other"]);
+        commit(dir.path(), "unrelated");
+        let err = default_base(dir.path(), "main", "HEAD").unwrap_err();
+        assert!(err.to_string().contains("no common ancestor"), "{err}");
+        assert!(err.to_string().contains("pass --base"), "{err}");
     }
 
     #[test]

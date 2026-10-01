@@ -6,6 +6,16 @@ use std::{
     process::Command,
 };
 
+/// Variables that point git at another repository; cleared so a hook running `cargo test`
+/// can't redirect the temp repos into the developer's.
+const REPO_VARS: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+];
+
 /// A fixture copied into a temp dir and committed as the first commit on `main`.
 pub struct Repo {
     dir: tempfile::TempDir,
@@ -47,11 +57,11 @@ impl Repo {
     }
 
     pub fn git(&self, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(self.path())
-            .output()
-            .unwrap();
+        let mut git = Command::new("git");
+        REPO_VARS.iter().for_each(|var| {
+            git.env_remove(var);
+        });
+        let out = git.args(args).current_dir(self.path()).output().unwrap();
         assert!(
             out.status.success(),
             "git {args:?}: {}",
@@ -74,6 +84,9 @@ impl Repo {
 
     pub fn ax(&self) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::new(env!("CARGO_BIN_EXE_ax"));
+        REPO_VARS.iter().for_each(|var| {
+            cmd.env_remove(var);
+        });
         cmd.current_dir(self.path());
         cmd
     }
