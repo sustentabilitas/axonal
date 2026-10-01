@@ -7,7 +7,7 @@ use std::{
     io::{self, Write},
     path::Path,
     pin::pin,
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
@@ -15,17 +15,26 @@ use std::{
 use serde::Serialize;
 use tap::Tap;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::{Child, Command},
     task::{self, JoinSet},
 };
 
 use crate::{
     cache::{CacheError, LogLine, Meta, Store, archive},
+    error::Error,
     files::Patterns,
     graph::{TaskGraph, TaskId, Workspace},
     hash::Key,
 };
+
+/// Longest line printed or captured whole; longer ones are split into lines this long.
+const MAX_LINE: u64 = 64 << 10;
+/// Most bytes of output captured for the cache; a task printing more isn't cached.
+#[cfg(not(test))]
+const MAX_LOGS: usize = 8 << 20;
+#[cfg(test)]
+const MAX_LOGS: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -279,7 +288,7 @@ impl Job {
             match self.restore(&target.outputs).await {
                 Ok(Some(logs)) => {
                     logs.iter()
-                        .for_each(|line| self.emit(&line.text, line.stderr));
+                        .for_each(|line| self.emit(line.text.as_bytes(), line.stderr));
                     return (self.result(Outcome::CacheHit, Some(0), started), warnings);
                 }
                 Ok(None) => {}
@@ -289,30 +298,45 @@ impl Job {
                 )),
             }
         }
-        let (code, logs) = match self.spawn(&target.command, &cwd).await {
-            Ok(done) => done,
+        let (outcome, exit_code) = match self.spawn(&target.command, &cwd, cacheable).await {
             Err(e) => {
                 let message = format!("failed to start `{}`: {e}", target.command);
-                self.emit(&message, true);
-                (-1, vec![])
+                self.emit(message.as_bytes(), true);
+                (Outcome::Failed, None)
             }
-        };
-        if code == 0 && cacheable {
-            let duration_ms = elapsed_ms(started);
-            match self.save(&target.outputs, code, duration_ms, logs).await {
-                Ok(()) => {}
-                Err(e) if e.downcast_ref().is_some_and(is_uncacheable) => {
-                    warnings.push(format!("{}: outputs not cached: {e:#}", self.id));
+            Ok((0, logs)) => {
+                if cacheable {
+                    warnings.extend(self.cache(&target.outputs, logs, started).await);
                 }
-                Err(e) => warnings.push(format!("{}: cache write failed: {e:#}", self.id)),
+                (Outcome::Ran, Some(0))
             }
-        }
-        let outcome = if code == 0 {
-            Outcome::Ran
-        } else {
-            Outcome::Failed
+            Ok((code, _)) => (Outcome::Failed, Some(code)),
         };
-        (self.result(outcome, Some(code), started), warnings)
+        (self.result(outcome, exit_code, started), warnings)
+    }
+
+    /// Saves a success, or explains why it wasn't. Without `logs`, they overflowed.
+    async fn cache(
+        &self,
+        outputs: &[String],
+        logs: Option<Vec<LogLine>>,
+        started: Instant,
+    ) -> Option<String> {
+        let Some(logs) = logs else {
+            return Some(format!(
+                "{}: outputs not cached: logs exceed {} MiB",
+                self.id,
+                MAX_LOGS >> 20
+            ));
+        };
+        let saved = self.save(outputs, elapsed_ms(started), logs).await;
+        saved.err().map(|e| {
+            if is_uncacheable(&e) {
+                format!("{}: outputs not cached: {e:#}", self.id)
+            } else {
+                format!("{}: cache write failed: {e:#}", self.id)
+            }
+        })
     }
 
     fn result(&self, outcome: Outcome, exit_code: Option<i32>, started: Instant) -> TaskResult {
@@ -327,6 +351,7 @@ impl Job {
 
     /// Replays a cached success, replacing the outputs present. Corrupt entries are removed
     /// by the store, broken archives here; both surface as errors (warned, then run).
+    /// Outputs behind a symlink are a silent miss: the save after the run warns.
     async fn restore(&self, outputs: &[String]) -> anyhow::Result<Option<Vec<LogLine>>> {
         let patterns = Patterns::new(outputs)?;
         let (store, key, root) = (self.store.clone(), self.key.clone(), self.ws.root.clone());
@@ -338,7 +363,10 @@ impl Job {
             if entry.meta.exit_code != 0 {
                 return Ok(None);
             }
-            let stale = patterns.existing_files(&root, &project_root)?;
+            let stale = match patterns.existing_files(&root, &project_root) {
+                Err(Error::SymlinkedOutputPath { .. }) => return Ok(None),
+                stale => stale?,
+            };
             match archive::restore(&root, &entry.meta, &entry.archive, &stale) {
                 // A broken archive would fail every hit: drop it so the next run re-saves.
                 Err(e) if e.is_archive_fault() => {
@@ -354,7 +382,6 @@ impl Job {
     async fn save(
         &self,
         outputs: &[String],
-        exit_code: i32,
         duration_ms: u64,
         logs: Vec<LogLine>,
     ) -> anyhow::Result<()> {
@@ -364,13 +391,20 @@ impl Job {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let files = patterns.existing_files(&root, &project_root)?;
             let packed = archive::pack(&root, &files, 0)?;
-            let meta = Meta::new(key.clone(), exit_code, duration_ms, logs, &packed);
+            let meta = Meta::new(key.clone(), 0, duration_ms, logs, &packed);
             Ok(store.put(&key, &meta, packed.path())?)
         })
         .await?
     }
 
-    async fn spawn(&self, command: &str, cwd: &Path) -> io::Result<(i32, Vec<LogLine>)> {
+    /// Runs `command`, printing its output and, when `capture`, keeping it for the cache:
+    /// the logs are `None` if not captured or past [`MAX_LOGS`].
+    async fn spawn(
+        &self,
+        command: &str,
+        cwd: &Path,
+        capture: bool,
+    ) -> io::Result<(i32, Option<Vec<LogLine>>)> {
         let mut child = shell(command)
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -379,62 +413,113 @@ impl Job {
             .kill_on_drop(true)
             .spawn()?;
         let group = Group::of(&child);
-        let logs = Mutex::new(Vec::new());
+        let logs = capture.then(|| Mutex::new(Capture::new()));
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let (out, err) = tokio::join!(
-            self.pump(stdout, &logs, false),
-            self.pump(stderr, &logs, true)
+            self.pump(stdout, logs.as_ref(), false),
+            self.pump(stderr, logs.as_ref(), true)
         );
         out.and(err)?;
         let status = child.wait().await?;
         group.disarm();
-        Ok((
-            status.code().unwrap_or(-1),
-            logs.into_inner().unwrap_or_else(PoisonError::into_inner),
-        ))
+        let logs = logs.and_then(|logs| {
+            logs.into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .lines
+        });
+        Ok((exit_code(status), logs))
     }
 
+    /// Prints and captures `stream` line by line, splitting lines at [`MAX_LINE`] bytes.
     async fn pump(
         &self,
         stream: Option<impl AsyncRead + Unpin>,
-        logs: &Mutex<Vec<LogLine>>,
-        is_stderr: bool,
+        logs: Option<&Mutex<Capture>>,
+        stderr: bool,
     ) -> io::Result<()> {
         let Some(stream) = stream else {
             return Ok(());
         };
         let mut reader = BufReader::new(stream);
         let mut buf = Vec::new();
-        while reader.read_until(b'\n', &mut buf).await? > 0 {
-            {
-                let text = String::from_utf8_lossy(&buf);
-                let line = text.trim_end_matches(['\n', '\r']);
-                self.emit(line, is_stderr);
+        while (&mut reader)
+            .take(MAX_LINE)
+            .read_until(b'\n', &mut buf)
+            .await?
+            > 0
+        {
+            let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            self.emit(line, stderr);
+            if let Some(logs) = logs {
                 logs.lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .push(LogLine {
-                        stderr: is_stderr,
-                        text: line.into(),
-                    });
+                    .push(stderr, line);
             }
             buf.clear();
         }
         Ok(())
     }
 
-    fn emit(&self, line: &str, is_stderr: bool) {
-        let text = format!("{} | {line}\n", self.id);
-        let _ = if is_stderr || self.to_stderr {
-            io::stderr().lock().write_all(text.as_bytes())
+    /// Writes `line` as is, prefixed with the task.
+    fn emit(&self, line: &[u8], stderr: bool) {
+        let text = [format!("{} | ", self.id).as_bytes(), line, b"\n"].concat();
+        let _ = if stderr || self.to_stderr {
+            io::stderr().lock().write_all(&text)
         } else {
-            io::stdout().lock().write_all(text.as_bytes())
+            io::stdout().lock().write_all(&text)
         };
     }
 }
 
-/// Outputs that `pack` refuses: the save is skipped, not failed.
-fn is_uncacheable(e: &CacheError) -> bool {
-    matches!(e, CacheError::Symlink(_) | CacheError::NotAFile(_))
+/// Output lines captured for the cache, abandoned past [`MAX_LOGS`] bytes of text so
+/// a replay is never truncated.
+struct Capture {
+    bytes: usize,
+    lines: Option<Vec<LogLine>>,
+}
+
+impl Capture {
+    fn new() -> Capture {
+        Capture {
+            bytes: 0,
+            lines: Some(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, stderr: bool, line: &[u8]) {
+        self.bytes = self.bytes.saturating_add(line.len());
+        if self.bytes > MAX_LOGS {
+            self.lines = None;
+        }
+        if let Some(lines) = &mut self.lines {
+            lines.push(LogLine {
+                stderr,
+                text: String::from_utf8_lossy(line).into_owned(),
+            });
+        }
+    }
+}
+
+/// Outputs that can't be cached, behind or being symlinks or special files: the save is
+/// skipped, not failed.
+fn is_uncacheable(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<CacheError>()
+        .is_some_and(|e| matches!(e, CacheError::Symlink(_) | CacheError::NotAFile(_)))
+        || e.downcast_ref::<Error>()
+            .is_some_and(|e| matches!(e, Error::SymlinkedOutputPath { .. }))
+}
+
+/// The exit code, or 128 plus the signal that killed the process, as shells report it.
+fn exit_code(status: ExitStatus) -> i32 {
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    #[cfg(not(unix))]
+    let signal = None;
+    status
+        .code()
+        .or_else(|| signal.map(|s| 128 + s))
+        .unwrap_or(-1)
 }
 
 /// A task's process group (on Unix), killed with everything in it if dropped armed, e.g.
@@ -465,15 +550,19 @@ impl Drop for Group {
     }
 }
 
-/// The platform shell, running `command` in a new process group on Unix.
+/// `cmd /C`, passed `command` verbatim since `cmd` doesn't parse arguments the usual way.
+#[cfg(windows)]
 fn shell(command: &str) -> Command {
-    let (program, flag) = if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
-    };
-    Command::new(program).tap_mut(|cmd| {
-        cmd.args([flag, command]);
+    Command::new("cmd").tap_mut(|cmd| {
+        cmd.arg("/C").raw_arg(command);
+    })
+}
+
+/// `sh -c`, in a new process group on Unix.
+#[cfg(not(windows))]
+fn shell(command: &str) -> Command {
+    Command::new("sh").tap_mut(|cmd| {
+        cmd.args(["-c", command]);
         #[cfg(unix)]
         cmd.process_group(0);
     })
@@ -518,6 +607,7 @@ mod tests {
         assert_eq!(RunReport::default().exit_code(), 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn runs_dependencies_first_then_hits_the_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -631,6 +721,121 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn logs_over_the_cap_are_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let lines = MAX_LOGS / 99 + 1;
+        let (ws, graph) = single(&root, &format!("yes {} | head -n {lines}", "x".repeat(99)));
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let report = run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
+        assert_eq!(report.tasks[0].outcome, Outcome::Ran);
+        assert_eq!(
+            report.warnings,
+            [format!(
+                "p:build: outputs not cached: logs exceed {} MiB",
+                MAX_LOGS >> 20
+            )]
+        );
+        assert!(stored(&store, &graph).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_lines_are_split_into_bounded_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (ws, graph) = single(&root, "head -c 1000000 /dev/zero | tr '\\0' a");
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let report = run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
+        assert_eq!(report.tasks[0].outcome, Outcome::Ran);
+        let logs = stored(&store, &graph).unwrap().logs;
+        assert_eq!(logs.len(), 1_000_000_usize.div_ceil(MAX_LINE as usize));
+        assert!(
+            logs.iter()
+                .all(|l| !l.stderr && l.text.len() <= MAX_LINE as usize)
+        );
+        assert_eq!(logs.iter().map(|l| l.text.len()).sum::<usize>(), 1_000_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failures_are_never_cached_and_output_needs_no_newline_or_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (ws, graph) = single(
+            &root,
+            r"printf 'a\377b\nno-newline'; printf 'err\n' >&2; exit 2",
+        );
+        let keys = keys(&graph);
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        for _ in 0..2 {
+            let r = run(ws.clone(), &graph, &keys, store.clone(), &options(1)).await;
+            assert_eq!(r.tasks[0].outcome, Outcome::Failed);
+            assert_eq!(r.tasks[0].exit_code, Some(2));
+        }
+        assert!(stored(&store, &graph).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signal_death_exits_128_plus_the_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (ws, graph) = single(&root, "kill -TERM $$");
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let report = run(ws, &graph, &keys(&graph), store, &options(1)).await;
+        assert_eq!(report.tasks[0].outcome, Outcome::Failed);
+        assert_eq!(report.tasks[0].exit_code, Some(128 + 15));
+    }
+
+    #[tokio::test]
+    async fn a_task_that_cannot_start_has_no_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (ws, graph) = single(&root, "true");
+        std::fs::remove_dir(root.join("p")).unwrap();
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let report = run(ws, &graph, &keys(&graph), store, &options(1)).await;
+        assert_eq!(report.tasks[0].outcome, Outcome::Failed);
+        assert_eq!(report.tasks[0].exit_code, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keep_going_skips_dependents_of_failures_transitively_even_at_parallel_0() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let build = |name: &str, deps: &[&str], command: &str| {
+            let depends_on: &[&str] = if deps.is_empty() { &[] } else { &["^build"] };
+            project(name, deps, &[("build", depends_on)])
+                .tap_mut(|p| p.targets.get_mut("build").unwrap().command = command.into())
+        };
+        let ws = ws_at(
+            &root,
+            vec![
+                build("util", &[], "exit 1"),
+                build("lib", &["util"], "true"),
+                build("app", &["lib"], "true"),
+                build("tool", &[], "true"),
+            ],
+        );
+        let graph = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let opts = RunOptions {
+            parallel: 0,
+            keep_going: true,
+            use_cache: false,
+            json: true,
+        };
+        let report = run(Arc::new(ws), &graph, &keys(&graph), store, &opts).await;
+        assert_eq!(
+            report.summary(),
+            "4 tasks: 1 ran, 0 cache hits, 1 failed, 2 skipped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_symlinked_output_path_warns_and_runs_uncached() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -661,12 +866,13 @@ mod tests {
             "1 tasks: 1 ran, 0 cache hits, 0 failed, 0 skipped"
         );
         assert_eq!(second.exit_code(), 0);
-        let [read, write] = second.warnings.as_slice() else {
+        let [warning] = second.warnings.as_slice() else {
             panic!("{:?}", second.warnings);
         };
-        assert!(read.starts_with("lib:build: cache read failed, running instead: "));
-        assert!(write.starts_with("lib:build: cache write failed: "));
-        assert!(read.contains("symlink") && write.contains("symlink"));
+        assert!(
+            warning.starts_with("lib:build: outputs not cached: output path lib is a symlink"),
+            "{warning}"
+        );
         assert!(
             store
                 .get(&keys[&TaskId::new("lib", "build")])
