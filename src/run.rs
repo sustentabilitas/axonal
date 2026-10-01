@@ -80,7 +80,7 @@ pub struct TaskResult {
 pub struct RunReport {
     pub tasks: Vec<TaskResult>,
     pub warnings: Vec<String>,
-    /// Whether Ctrl-C or SIGTERM cut the run short.
+    /// Whether Ctrl-C or SIGTERM, SIGHUP or SIGQUIT cut the run short.
     pub interrupted: bool,
 }
 
@@ -128,10 +128,10 @@ pub fn default_parallelism() -> usize {
 /// On Unix each task runs in its own process group. Stopping tasks sends their groups
 /// SIGTERM and gives them [`GRACE`] to exit before killing them; a task whose shell exits
 /// while processes it left behind still hold its output has them killed after [`DRAIN`].
-/// Ctrl-C (and SIGTERM on Unix) stops every running task: persistent ones are `Stopped`,
-/// the rest `Failed`, the unstarted `Skipped`, and a second Ctrl-C kills at once. The
-/// signal handlers are installed when `run` is called and stay installed after it returns.
-/// Dropping the future kills every running task's group.
+/// Ctrl-C (and SIGTERM, SIGHUP and SIGQUIT on Unix) stops every running task: persistent
+/// ones are `Stopped`, the rest `Failed`, the unstarted `Skipped`, and a second Ctrl-C
+/// kills at once. The signal handlers are installed when `run` is called and stay
+/// installed after it returns. Dropping the future kills every running task's group.
 ///
 /// # Panics
 ///
@@ -376,18 +376,26 @@ async fn until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-/// Ctrl-C, or SIGINT and SIGTERM on Unix, listened for from creation. Tokio never removes
-/// the handlers, so these signals no longer terminate the process afterwards.
+/// Ctrl-C, or SIGINT, SIGTERM, SIGHUP and SIGQUIT on Unix, listened for from creation.
+/// Tasks run in their own process groups, so a hangup from a closed terminal reaches only
+/// axonal, which must pass it on. Tokio never removes the handlers, so these signals no
+/// longer terminate the process afterwards.
 struct Interrupts {
     #[cfg(unix)]
-    signals: [Option<Signal>; 2],
+    signals: [Option<Signal>; 4],
 }
 
 impl Interrupts {
     fn new() -> Interrupts {
         Interrupts {
             #[cfg(unix)]
-            signals: [SignalKind::interrupt(), SignalKind::terminate()].map(|k| signal(k).ok()),
+            signals: [
+                SignalKind::interrupt(),
+                SignalKind::terminate(),
+                SignalKind::hangup(),
+                SignalKind::quit(),
+            ]
+            .map(|k| signal(k).ok()),
         }
     }
 
@@ -395,10 +403,12 @@ impl Interrupts {
     async fn recv(&mut self) {
         #[cfg(unix)]
         {
-            let [int, term] = &mut self.signals;
+            let [int, term, hup, quit] = &mut self.signals;
             tokio::select! {
                 () = received(int) => {}
                 () = received(term) => {}
+                () = received(hup) => {}
+                () = received(quit) => {}
             }
         }
         #[cfg(not(unix))]
@@ -1011,38 +1021,146 @@ mod tests {
             .expect("the background child was killed");
     }
 
-    /// Signals the whole test process, so it would interrupt any run in parallel with it.
+    /// Where [`signalled_run`] runs, set only in the test binary it re-executes.
+    #[cfg(unix)]
+    const SIGNALLED_ROOT: &str = "AXONAL_TEST_SIGNALLED_ROOT";
+
+    /// A server and a slow build run until a signal stops them, written up to `report`.
+    /// Does nothing unless re-executed by [`signal_stops_every_task`], so that the signal
+    /// reaches no other test.
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "sends SIGINT to the test process"]
-    async fn ctrl_c_stops_persistent_tasks_and_fails_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+    async fn signalled_run() {
+        let Some(root) = std::env::var_os(SIGNALLED_ROOT) else {
+            return;
+        };
+        let root = Path::new(&root);
         let srv = server(
             "srv",
-            "trap 'echo bye > ../t; exit 0' TERM; touch ../ready; sleep 60 & wait",
+            "trap 'echo bye > ../t; exit 0' TERM; echo $$ > ../srv.pid; sleep 60 & wait",
         );
-        let slow = build("slow", "sleep 60");
-        let ws = ws_at(&root, vec![srv, slow]);
+        let slow = build("slow", "echo $$ > ../slow.pid; sleep 60");
+        let ws = ws_at(root, vec![srv, slow]);
         let roots = vec![TaskId::new("srv", "dev"), TaskId::new("slow", "build")];
         let graph = TaskGraph::from_roots(&ws, roots).unwrap();
-        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
-        let ready = root.join("ready");
-        let interrupt = async {
-            while !ready.exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            // SAFETY: `run` has installed its SIGINT handler, so this only notifies it.
-            unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        let store: Arc<dyn Store> = Arc::new(Local::new(root));
+        let opts = options(2);
+        let report = run(Arc::new(ws), &graph, &keys(&graph), store, &opts).await;
+        let interrupted = if report.interrupted {
+            "interrupted"
+        } else {
+            ""
         };
-        let (keys, opts) = (keys(&graph), options(2));
-        let (report, ()) = tokio::join!(run(Arc::new(ws), &graph, &keys, store, &opts), interrupt);
-        assert!(report.interrupted);
+        std::fs::write(
+            root.join("report"),
+            format!("{}; {interrupted}", report.summary()),
+        )
+        .unwrap();
+    }
+
+    /// Runs [`signalled_run`] in a subprocess, sends it `signal` once its tasks have
+    /// started, and checks that it stopped them all, their process groups included.
+    #[cfg(unix)]
+    fn signal_stops_every_task(signal: libc::c_int) {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "run::tests::signalled_run", "--nocapture"])
+            .env(SIGNALLED_ROOT, &root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = |name: &str| -> Option<libc::pid_t> {
+            std::fs::read_to_string(root.join(format!("{name}.pid")))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        let mut groups = None;
+        let started = within(Duration::from_secs(10), || {
+            groups = pid("srv").zip(pid("slow")).map(|(a, b)| [a, b]);
+            groups.is_some()
+        });
+        let child_pid = libc::pid_t::try_from(child.id()).unwrap();
+        // SAFETY: only signals the child, which handles it once its tasks have started.
+        unsafe { libc::kill(child_pid, signal) };
+        let exited = within(Duration::from_secs(10), || {
+            child.try_wait().unwrap().is_some()
+        });
+        let groups = groups.unwrap_or_default();
+        let gone = within(Duration::from_secs(5), || {
+            !groups.iter().any(|&g| group_exists(g))
+        });
+        groups.iter().for_each(|&g| {
+            // SAFETY: only signals the groups of the tasks this test started.
+            unsafe { libc::killpg(g, libc::SIGKILL) };
+        });
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(started, "the tasks didn't start: {log}");
+        assert!(
+            exited && output.status.success(),
+            "{:?}: {log}",
+            output.status
+        );
+        assert!(gone, "task process groups outlived the run: {log}");
         assert_eq!(
-            report.summary(),
-            "2 tasks: 0 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped"
+            std::fs::read_to_string(root.join("report")).unwrap(),
+            "2 tasks: 0 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped; interrupted"
         );
         assert_eq!(std::fs::read_to_string(root.join("t")).unwrap(), "bye\n");
+    }
+
+    /// Whether `done` holds within `limit`, checking it every 10 ms.
+    #[cfg(unix)]
+    fn within(limit: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !done() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn group_exists(pgid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 sends nothing; it only checks that a member exists.
+        unsafe { libc::killpg(pgid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_stops_persistent_tasks_and_fails_the_rest() {
+        signal_stops_every_task(libc::SIGINT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_stops_every_task() {
+        signal_stops_every_task(libc::SIGTERM);
+    }
+
+    /// Closing the terminal signals axonal's process group, not its tasks' own groups.
+    #[cfg(unix)]
+    #[test]
+    fn sighup_stops_every_task() {
+        signal_stops_every_task(libc::SIGHUP);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigquit_stops_every_task() {
+        signal_stops_every_task(libc::SIGQUIT);
     }
 
     #[cfg(unix)]
