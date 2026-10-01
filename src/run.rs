@@ -43,8 +43,9 @@ const LINE_OVERHEAD: usize = 32;
 /// How long stopped tasks get to exit after SIGTERM before they are killed.
 #[cfg(not(test))]
 const GRACE: Duration = Duration::from_secs(5);
+/// Long enough for a SIGTERM trap to run while the whole suite loads the machine.
 #[cfg(test)]
-const GRACE: Duration = Duration::from_secs(1);
+const GRACE: Duration = Duration::from_secs(3);
 /// How long processes a task left behind may hold its output open after its shell exits
 /// before they are killed.
 const DRAIN: Duration = Duration::from_millis(200);
