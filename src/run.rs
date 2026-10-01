@@ -41,7 +41,10 @@ const MAX_LOGS: usize = 1 << 20;
 /// what a line costs in memory and in the cached JSON.
 const LINE_OVERHEAD: usize = 32;
 /// How long stopped tasks get to exit after SIGTERM before they are killed.
+#[cfg(not(test))]
 const GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const GRACE: Duration = Duration::from_secs(1);
 /// How long processes a task left behind may hold its output open after its shell exits
 /// before they are killed.
 const DRAIN: Duration = Duration::from_millis(200);
@@ -1033,6 +1036,52 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn tasks_ignoring_sigterm_are_killed_after_the_grace_with_their_children() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let srv = server(
+            "srv",
+            "trap '' TERM; sleep 60 & echo $! > ../child.pid; echo $$ > ../srv.pid; wait",
+        );
+        let bad = build(
+            "bad",
+            "while [ ! -s ../srv.pid ]; do sleep 0.01; done; exit 3",
+        );
+        let ws = ws_at(&root, vec![srv, bad]);
+        let roots = vec![TaskId::new("srv", "dev"), TaskId::new("bad", "build")];
+        let graph = TaskGraph::from_roots(&ws, roots).unwrap();
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let started = Instant::now();
+        let report = tokio::time::timeout(
+            GRACE + Duration::from_secs(3),
+            run(Arc::new(ws), &graph, &keys(&graph), store, &options(1)),
+        )
+        .await
+        .expect("the run outlived the grace");
+        assert!(started.elapsed() >= GRACE, "{:?}", started.elapsed());
+        assert_eq!(
+            report.summary(),
+            "2 tasks: 0 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped"
+        );
+        assert_eq!(report.warnings, ["killed 1 tasks that didn't stop"]);
+        let pid = |name: &str| -> libc::pid_t {
+            let pid = std::fs::read_to_string(root.join(format!("{name}.pid"))).unwrap();
+            pid.trim().parse().unwrap()
+        };
+        let (srv, child) = (pid("srv"), pid("child"));
+        let gone = async {
+            while group_exists(srv) || is_alive(child) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), gone)
+            .await
+            .expect("the task's process group outlived the run");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn stopping_lets_persistent_tasks_shut_down_gracefully() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -1092,9 +1141,13 @@ mod tests {
     #[cfg(unix)]
     const SIGNALLED_ROOT: &str = "AXONAL_TEST_SIGNALLED_ROOT";
 
-    /// A server and a slow build run until a signal stops them, written up to `report`.
-    /// Does nothing unless re-executed by [`signal_stops_every_task`], so that the signal
-    /// reaches no other test.
+    /// The tasks of [`signalled_run`], each writing its pid to `<name>.pid` once started.
+    #[cfg(unix)]
+    const SIGNALLED_TASKS: [&str; 3] = ["srv", "slow", "graceful"];
+
+    /// A server, a slow build and a build that succeeds on SIGTERM run until a signal
+    /// stops them, written up to `report`. Does nothing unless re-executed by
+    /// [`signal_stops_every_task`], so that the signal reaches no other test.
     #[cfg(unix)]
     #[tokio::test]
     async fn signalled_run() {
@@ -1107,11 +1160,19 @@ mod tests {
             "trap 'echo bye > ../t; exit 0' TERM; echo $$ > ../srv.pid; sleep 60 & wait",
         );
         let slow = build("slow", "echo $$ > ../slow.pid; sleep 60");
-        let ws = ws_at(root, vec![srv, slow]);
-        let roots = vec![TaskId::new("srv", "dev"), TaskId::new("slow", "build")];
+        let graceful = build(
+            "graceful",
+            "trap 'exit 0' TERM; echo $$ > ../graceful.pid; sleep 60 & wait",
+        );
+        let ws = ws_at(root, vec![srv, slow, graceful]);
+        let roots = vec![
+            TaskId::new("srv", "dev"),
+            TaskId::new("slow", "build"),
+            TaskId::new("graceful", "build"),
+        ];
         let graph = TaskGraph::from_roots(&ws, roots).unwrap();
         let store: Arc<dyn Store> = Arc::new(Local::new(root));
-        let opts = options(2);
+        let opts = options(3);
         let report = run(Arc::new(ws), &graph, &keys(&graph), store, &opts).await;
         let interrupted = if report.interrupted {
             "interrupted"
@@ -1126,7 +1187,8 @@ mod tests {
     }
 
     /// Runs [`signalled_run`] in a subprocess, sends it `signal` once its tasks have
-    /// started, and checks that it stopped them all, their process groups included.
+    /// started, and checks that it stopped them all, their process groups included, and
+    /// didn't cache the success of a task cut short.
     #[cfg(unix)]
     fn signal_stops_every_task(signal: libc::c_int) {
         use std::time::Duration;
@@ -1148,7 +1210,7 @@ mod tests {
         };
         let mut groups = None;
         let started = within(Duration::from_secs(10), || {
-            groups = pid("srv").zip(pid("slow")).map(|(a, b)| [a, b]);
+            groups = SIGNALLED_TASKS.iter().map(|name| pid(name)).collect();
             groups.is_some()
         });
         let child_pid = libc::pid_t::try_from(child.id()).unwrap();
@@ -1157,7 +1219,7 @@ mod tests {
         let exited = within(Duration::from_secs(10), || {
             child.try_wait().unwrap().is_some()
         });
-        let groups = groups.unwrap_or_default();
+        let groups: Vec<_> = groups.unwrap_or_default();
         let gone = within(Duration::from_secs(5), || {
             !groups.iter().any(|&g| group_exists(g))
         });
@@ -1181,9 +1243,11 @@ mod tests {
         assert!(gone, "task process groups outlived the run: {log}");
         assert_eq!(
             std::fs::read_to_string(root.join("report")).unwrap(),
-            "2 tasks: 0 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped; interrupted"
+            "3 tasks: 1 ran, 0 cache hits, 1 failed, 0 skipped, 1 stopped; interrupted"
         );
         assert_eq!(std::fs::read_to_string(root.join("t")).unwrap(), "bye\n");
+        let graceful = Key("graceful_build".into());
+        assert!(Local::new(&root).get(&graceful).unwrap().is_none());
     }
 
     /// Whether `done` holds within `limit`, checking it every 10 ms.
@@ -1325,6 +1389,54 @@ mod tests {
             stderr,
             text: text.into(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_broken_archive_is_dropped_and_the_task_runs_instead() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let p = build(
+            "p",
+            "echo built > out.txt; echo run >> ../runs; [ $(wc -l < ../runs) -eq 1 ]",
+        )
+        .tap_mut(|p| p.targets.get_mut("build").unwrap().outputs = vec!["out.txt".into()]);
+        let ws = Arc::new(ws_at(&root, vec![p]));
+        let graph = TaskGraph::build(&ws, &["build".into()], None).unwrap();
+        let keys = keys(&graph);
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let first = run(ws.clone(), &graph, &keys, store.clone(), &options(1)).await;
+        assert_eq!(first.tasks[0].outcome, Outcome::Ran);
+
+        let key = &keys[&graph.order[0]];
+        let cache = Local::new(&root).dir().to_path_buf();
+        let garbage = b"not an archive";
+        std::fs::write(cache.join(format!("{key}.tar.zst")), garbage).unwrap();
+        let meta_path = cache.join(format!("{key}.json"));
+        let meta: Meta = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        let meta = Meta {
+            archive_blake3: blake3::hash(garbage).to_hex().to_string(),
+            ..meta
+        };
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let second = run(ws, &graph, &keys, store.clone(), &options(1)).await;
+        assert_eq!(
+            (second.tasks[0].outcome, second.tasks[0].exit_code),
+            (Outcome::Failed, Some(1))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("runs")).unwrap(),
+            "run\nrun\n"
+        );
+        let [warning] = second.warnings.as_slice() else {
+            panic!("{:?}", second.warnings);
+        };
+        assert!(
+            warning.starts_with("p:build: cache read failed, running instead: unreadable archive"),
+            "{warning}"
+        );
+        assert!(stored(&store, &graph).is_none());
     }
 
     #[cfg(unix)]
