@@ -37,6 +37,9 @@ const MAX_LINE: u64 = 64 << 10;
 const MAX_LOGS: usize = 8 << 20;
 #[cfg(test)]
 const MAX_LOGS: usize = 1 << 20;
+/// Bytes counted toward [`MAX_LOGS`] for each line besides its text and newline, roughly
+/// what a line costs in memory and in the cached JSON.
+const LINE_OVERHEAD: usize = 32;
 /// How long stopped tasks get to exit after SIGTERM before they are killed.
 const GRACE: Duration = Duration::from_secs(5);
 /// How long processes a task left behind may hold its output open after its shell exits
@@ -657,8 +660,8 @@ impl Job {
     }
 }
 
-/// Output lines captured for the cache, abandoned past [`MAX_LOGS`] bytes of text so
-/// a replay is never truncated.
+/// Output lines captured for the cache, abandoned past [`MAX_LOGS`] bytes, counting each
+/// line's newline and [`LINE_OVERHEAD`], so a replay is never truncated.
 struct Capture {
     bytes: usize,
     lines: Option<Vec<LogLine>>,
@@ -673,7 +676,7 @@ impl Capture {
     }
 
     fn push(&mut self, stderr: bool, line: &[u8]) {
-        self.bytes = self.bytes.saturating_add(line.len());
+        self.bytes = self.bytes.saturating_add(line.len() + 1 + LINE_OVERHEAD);
         if self.bytes > MAX_LOGS {
             self.lines = None;
         }
@@ -1282,6 +1285,26 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let lines = MAX_LOGS / 99 + 1;
         let (ws, graph) = single(&root, &format!("yes {} | head -n {lines}", "x".repeat(99)));
+        let store: Arc<dyn Store> = Arc::new(Local::new(&root));
+        let report = run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
+        assert_eq!(report.tasks[0].outcome, Outcome::Ran);
+        assert_eq!(
+            report.warnings,
+            [format!(
+                "p:build: outputs not cached: logs exceed {} MiB",
+                MAX_LOGS >> 20
+            )]
+        );
+        assert!(stored(&store, &graph).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blank_lines_count_toward_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let lines = MAX_LOGS / (1 + LINE_OVERHEAD) + 1;
+        let (ws, graph) = single(&root, &format!("yes '' | head -n {lines}"));
         let store: Arc<dyn Store> = Arc::new(Local::new(&root));
         let report = run(ws, &graph, &keys(&graph), store.clone(), &options(1)).await;
         assert_eq!(report.tasks[0].outcome, Outcome::Ran);
