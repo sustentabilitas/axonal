@@ -114,11 +114,12 @@ struct Hashed {
 /// What hashing one path yields.
 enum Computed {
     Hashed(Hashed),
-    /// A link, with text `link`, to the workspace directory `target`: its digest folds in
-    /// the listed files under `target`, once they're hashed.
-    WorkspaceDir {
+    /// A link, with text `link`, to a directory: its digest folds in `entries`, every
+    /// non-directory path under the link (see [`dir_entries`]), once they're hashed
+    /// through it.
+    DirLink {
         link: PathBuf,
-        target: PathBuf,
+        entries: Vec<PathBuf>,
     },
 }
 
@@ -177,45 +178,34 @@ impl FileHashCache {
     /// symlink's text and target (a directory's contents included), `special` for FIFOs,
     /// sockets and devices, or `missing`.
     pub fn hash(&mut self, root: &Path, rel: &Path) -> Result<String> {
-        let mut digests = self.hash_all(root, vec![rel], None)?;
+        let mut digests = self.hash_all(root, vec![rel])?;
         Ok(digests.remove(rel).unwrap_or_else(|| MISSING.into()))
     }
 
-    /// Digests of `paths`, hashed in parallel. A link to a directory inside the workspace
-    /// folds in the (stamped) digests of the files `listed` under it, sorted
-    /// workspace-relative paths (`None` lists the workspace afresh). If several paths
-    /// fail, the error is the one for the smallest.
+    /// Digests of `paths`, hashed in parallel. A directory link folds in the digests of
+    /// the entries under it, hashed and stamped through the link. If several paths fail,
+    /// the error is the one for the smallest.
     fn hash_all<'p>(
         &mut self,
         root: &Path,
         paths: Vec<&'p Path>,
-        listed: Option<&[PathBuf]>,
     ) -> Result<HashMap<&'p Path, String>> {
-        let base = fs::canonicalize(root)?;
-        let computed = self.compute_all(root, &base, paths, Follow::Directories)?;
-        let targets: BTreeSet<&Path> = computed
+        let computed = self.compute_all(root, paths, Follow::Directories)?;
+        let inner: Vec<PathBuf> = computed
             .iter()
-            .filter_map(|(_, computed)| match computed {
-                Computed::WorkspaceDir { target, .. } => Some(target.as_path()),
-                Computed::Hashed(_) => None,
+            .flat_map(|(path, computed)| match computed {
+                Computed::DirLink { entries, .. } => {
+                    entries.iter().map(|entry| path.join(entry)).collect()
+                }
+                Computed::Hashed(_) => Vec::new(),
             })
             .collect();
-        let relisted;
-        let listed = match listed {
-            Some(files) => files,
-            None if targets.is_empty() => &[][..],
-            None => {
-                relisted = files::list(root)?;
-                &relisted[..]
-            }
-        };
-        let inner: BTreeSet<&Path> = targets
-            .iter()
-            .flat_map(|target| under(listed, target))
-            .map(PathBuf::as_path)
-            .collect();
         let inner: HashMap<&Path, String> = self
-            .compute_all(root, &base, inner.into_iter().collect(), Follow::Nothing)?
+            .compute_all(
+                root,
+                inner.iter().map(PathBuf::as_path).collect(),
+                Follow::Nothing,
+            )?
             .into_iter()
             .map(|(path, computed)| (path, digest_of(computed)))
             .collect();
@@ -223,14 +213,11 @@ impl FileHashCache {
             .into_iter()
             .map(|(path, computed)| match computed {
                 Computed::Hashed(hashed) => (path, hashed.digest),
-                Computed::WorkspaceDir { link, target } => {
-                    let entries = under(listed, &target).iter().map(|file| {
-                        (
-                            file.strip_prefix(&target).expect("listed under target"),
-                            inner[file.as_path()].as_str(),
-                        )
-                    });
-                    (path, link_digest(&link, dir_fields(entries)))
+                Computed::DirLink { link, entries } => {
+                    let digests = entries
+                        .iter()
+                        .map(|entry| (entry.as_path(), inner[path.join(entry).as_path()].as_str()));
+                    (path, link_digest(&link, dir_fields(digests)))
                 }
             })
             .collect())
@@ -240,13 +227,12 @@ impl FileHashCache {
     fn compute_all<'p>(
         &mut self,
         root: &Path,
-        base: &Path,
         paths: Vec<&'p Path>,
         follow: Follow,
     ) -> Result<Vec<(&'p Path, Computed)>> {
         let (computed, failed): (Vec<_>, Vec<_>) = paths
             .into_par_iter()
-            .map(|path| (path, self.compute(root, base, path, follow)))
+            .map(|path| (path, self.compute(root, path, follow)))
             .collect::<Vec<_>>()
             .into_iter()
             .partition(|(_, computed)| computed.is_ok());
@@ -259,7 +245,7 @@ impl FileHashCache {
             .map(|(path, mut computed)| {
                 let stamp = match &mut computed {
                     Computed::Hashed(hashed) => hashed.stamp.take(),
-                    Computed::WorkspaceDir { .. } => None,
+                    Computed::DirLink { .. } => None,
                 };
                 self.record(path, stamp);
                 (path, computed)
@@ -267,8 +253,7 @@ impl FileHashCache {
             .collect())
     }
 
-    /// `base` is the canonical `root`.
-    fn compute(&self, root: &Path, base: &Path, rel: &Path, follow: Follow) -> Result<Computed> {
+    fn compute(&self, root: &Path, rel: &Path, follow: Follow) -> Result<Computed> {
         let path = root.join(rel);
         let meta = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(uncached(MISSING)),
@@ -276,7 +261,7 @@ impl FileHashCache {
             Ok(meta) => meta,
         };
         if meta.is_symlink() {
-            return link(base, &path, rel, follow);
+            return link(&path, rel, follow);
         }
         if meta.is_dir() {
             return Ok(uncached("dir"));
@@ -284,7 +269,7 @@ impl FileHashCache {
         if !meta.is_file() {
             return Ok(uncached(SPECIAL));
         }
-        self.regular(root, base, rel, &meta, follow)
+        self.regular(root, rel, &meta, follow)
     }
 
     /// `rel`, which `meta` (its `lstat`) says is a regular file: from its stamp while the
@@ -294,7 +279,6 @@ impl FileHashCache {
     fn regular(
         &self,
         root: &Path,
-        base: &Path,
         rel: &Path,
         meta: &Metadata,
         follow: Follow,
@@ -315,7 +299,7 @@ impl FileHashCache {
                 }
                 Ok(None) => return Ok(uncached(SPECIAL)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(uncached(MISSING)),
-                Err(_) if is_symlink(&path) => return link(base, &path, rel, follow),
+                Err(_) if is_symlink(&path) => return link(&path, rel, follow),
                 Err(e) => return Err(input_error(rel, e)),
             },
         };
@@ -352,16 +336,6 @@ fn input_error(rel: &Path, source: io::Error) -> Error {
 
 fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink())
-}
-
-/// The sorted run of `files` under `dir`.
-fn under<'f>(files: &'f [PathBuf], dir: &Path) -> &'f [PathBuf] {
-    let start = files.partition_point(|file| file.as_path() < dir);
-    let len = files[start..]
-        .iter()
-        .take_while(|file| file.starts_with(dir))
-        .count();
-    &files[start..start + len]
 }
 
 /// Opens `path` non-blocking (so a FIFO opens at once), without becoming a controlling
@@ -413,23 +387,21 @@ fn file_digest(meta: &Metadata, content: &str) -> String {
 #[derive(Clone, Copy)]
 enum Follow {
     Directories,
-    /// For links met inside a followed directory, so link loops can't recurse.
+    /// For entries under a followed link, whose nested directory links [`dir_entries`]
+    /// has already expanded.
     Nothing,
 }
 
-/// A symlink found by `lstat`: a followed link to a workspace directory is folded later,
-/// from the listing; anything else is hashed now.
-fn link(base: &Path, path: &Path, rel: &Path, follow: Follow) -> Result<Computed> {
-    let target = fs::canonicalize(path)
-        .ok()
-        .filter(|target| target.is_dir())
-        .and_then(|target| target.strip_prefix(base).ok().map(Path::to_path_buf));
-    match (follow, target) {
-        (Follow::Directories, Some(target)) => Ok(Computed::WorkspaceDir {
+/// A symlink found by `lstat`: a followed link to a directory lists the entries to fold
+/// in; anything else is hashed now.
+fn link(path: &Path, rel: &Path, follow: Follow) -> Result<Computed> {
+    match (follow, fs::canonicalize(path).ok().filter(|t| t.is_dir())) {
+        (Follow::Directories, Some(target)) => Ok(Computed::DirLink {
             link: fs::read_link(path).map_err(|e| input_error(rel, e))?,
-            target,
+            entries: dir_entries(&target, &mut HashSet::from([target.clone()]))
+                .map_err(|e| input_error(rel, e))?,
         }),
-        _ => symlink_digest(path, rel, follow).map(uncached),
+        _ => symlink_digest(path, rel).map(uncached),
     }
 }
 
@@ -437,28 +409,27 @@ fn link(base: &Path, path: &Path, rel: &Path, follow: Follow) -> Result<Computed
 fn digest_of(computed: Computed) -> String {
     match computed {
         Computed::Hashed(hashed) => hashed.digest,
-        Computed::WorkspaceDir { link, .. } => link_digest(&link, "dir".into()),
+        Computed::DirLink { link, .. } => link_digest(&link, "dir".into()),
     }
 }
 
-/// The link text plus what it resolves to: a file's digest, a directory's contents (or
-/// just `dir`), `special`, or `dangling` (which covers loops too).
-fn symlink_digest(path: &Path, rel: &Path, follow: Follow) -> Result<String> {
+/// The link text plus what it resolves to: a file's digest, `dir`, `special`, or
+/// `dangling` (which covers loops too).
+fn symlink_digest(path: &Path, rel: &Path) -> Result<String> {
     let link = fs::read_link(path).map_err(|e| input_error(rel, e))?;
-    let target = match (fs::metadata(path), follow) {
-        (Ok(meta), Follow::Directories) if meta.is_dir() => dir_digest(path, rel)?,
-        (Ok(meta), Follow::Nothing) if meta.is_dir() => "dir".into(),
-        (Ok(meta), _) if !meta.is_file() => SPECIAL.into(),
-        (Ok(_), _) => match read_regular(path, true) {
+    let target = match fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => "dir".into(),
+        Ok(meta) if !meta.is_file() => SPECIAL.into(),
+        Ok(_) => match read_regular(path, true) {
             Ok(Some((meta, content))) => file_digest(&meta, &content),
             Ok(None) => SPECIAL.into(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => "dangling".into(),
             Err(e) => return Err(input_error(rel, e)),
         },
-        (Err(e), _) if e.kind() == io::ErrorKind::PermissionDenied => {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             return Err(input_error(rel, e));
         }
-        (Err(_), _) => "dangling".into(),
+        Err(_) => "dangling".into(),
     };
     Ok(link_digest(&link, target))
 }
@@ -478,48 +449,45 @@ fn dir_fields<'e>(entries: impl Iterator<Item = (&'e Path, &'e str)>) -> String 
     format!("dir:{}", fields.finish())
 }
 
-/// The directory `link` resolves to outside the workspace, listed as the workspace is:
-/// honouring its `.gitignore` files, skipping `.git`, `.axonal` and `node_modules`, and
-/// never following nested links.
-fn dir_digest(link: &Path, rel: &Path) -> Result<String> {
-    let base = fs::canonicalize(link).map_err(|e| input_error(rel, e))?;
-    let entries = files::list(&base).map_err(|e| match e {
-        Error::Io(e) => input_error(rel, e),
-        e => e,
-    })?;
-    let digests = entries
-        .iter()
-        .map(|inner| entry_digest(&base.join(inner), &rel.join(inner)))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(dir_fields(
-        entries
-            .iter()
-            .map(PathBuf::as_path)
-            .zip(digests.iter().map(String::as_str)),
-    ))
-}
+/// Directories never descended into below a followed directory link.
+const UNWALKED_DIRS: [&str; 3] = [".git", ".axonal", "node_modules"];
 
-/// A path inside a directory outside the workspace: a file's digest, a link's digest
-/// (never followed into directories), `special`, or `missing` if it vanished mid-walk.
-fn entry_digest(path: &Path, rel: &Path) -> Result<String> {
-    let meta = match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MISSING.into()),
-        Err(e) => return Err(input_error(rel, e)),
-        Ok(meta) => meta,
+/// Every non-directory entry under the canonical directory `dir`, relative to it and in
+/// sorted order. A directory link is an explicit reference, so ignore rules don't apply
+/// behind it; only [`UNWALKED_DIRS`] are skipped. Nested directory links are listed and
+/// followed too, unless their canonical target is already in `visited`, so loops end.
+fn dir_entries(dir: &Path, visited: &mut HashSet<PathBuf>) -> io::Result<Vec<PathBuf>> {
+    let mut names = match fs::read_dir(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        read => read?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?,
     };
-    if meta.is_symlink() {
-        return symlink_digest(path, rel, Follow::Nothing);
-    }
-    if !meta.is_file() {
-        return Ok(SPECIAL.into());
-    }
-    match read_regular(path, false) {
-        Ok(Some((meta, content))) => Ok(file_digest(&meta, &content)),
-        Ok(None) => Ok(SPECIAL.into()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(MISSING.into()),
-        Err(_) if is_symlink(path) => symlink_digest(path, rel, Follow::Nothing),
-        Err(e) => Err(input_error(rel, e)),
-    }
+    names.sort();
+    names.into_iter().try_fold(Vec::new(), |mut found, name| {
+        let path = dir.join(&name);
+        let unwalked = name.to_str().is_some_and(|n| UNWALKED_DIRS.contains(&n));
+        let descend = match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+            Ok(meta) if meta.is_dir() => {
+                visited.insert(path.clone());
+                (!unwalked).then_some(path)
+            }
+            Ok(meta) => {
+                found.push(PathBuf::from(&name));
+                meta.is_symlink()
+                    .then(|| fs::canonicalize(&path).ok())
+                    .flatten()
+                    .filter(|target| !unwalked && target.is_dir() && visited.insert(target.clone()))
+            }
+        };
+        if let Some(nested) = descend {
+            let inner = dir_entries(&nested, visited)?;
+            found.extend(inner.into_iter().map(|entry| Path::new(&name).join(entry)));
+        }
+        Ok(found)
+    })
 }
 
 fn is_racy(meta: &Metadata) -> bool {
@@ -795,7 +763,7 @@ pub fn task_keys(
         .iter()
         .map(|id| plan.task(id))
         .collect::<Result<Vec<_>>>()?;
-    let digests = files.hash_all(&ws.root, plan.files(), Some(&ws.files))?;
+    let digests = files.hash_all(&ws.root, plan.files())?;
     let mut dep_digests: HashMap<&[String], HashMap<&str, blake3::Hash>> = HashMap::new();
     let mut closure_digests = HashMap::new();
     Ok(tasks.iter().fold(BTreeMap::new(), |mut keys, task| {
@@ -1872,7 +1840,7 @@ command = "tsc"
         let path = root.join(FILE_HASHES);
         let mut disk: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        let stamp = &mut disk["entries"]["assets/data.txt"]["hash"];
+        let stamp = &mut disk["entries"]["libs/a/src/assets/data.txt"]["hash"];
         assert!(
             stamp.is_string(),
             "files behind the link are stamped: {disk}"
@@ -1887,40 +1855,127 @@ command = "tsc"
         assert_eq!(key_of(root, "build", "libs/a"), cold);
     }
 
+    /// Applies each edit in turn, asserting it changes `libs/a`'s build key (or, unless
+    /// `changes`, that it doesn't).
     #[cfg(unix)]
-    #[test]
-    fn workspace_directory_links_skip_ignored_and_axonal_files() {
-        let dir = one_project();
-        let root = dir.path();
-        write(root, "shared/.gitignore", "dist/\n");
-        write(root, "shared/src/x.ts", "x");
-        write(root, "shared/dist/x.js", "built 1");
-        write(root, "shared/.axonal/filehash.json", "{}");
-        std::os::unix::fs::symlink("../../../shared", root.join("libs/a/src/shared")).unwrap();
-        let before = key_of(root, "build", "libs/a");
-        write(root, "shared/dist/x.js", "built 2");
-        write(root, "shared/.axonal/filehash.json", "{\"x\":1}");
-        assert_eq!(key_of(root, "build", "libs/a"), before);
-        write(root, "shared/src/x.ts", "y");
-        assert_ne!(key_of(root, "build", "libs/a"), before);
+    fn assert_edits(root: &Path, changes: bool, edits: &[(&str, &str)]) {
+        edits
+            .iter()
+            .fold(key_of(root, "build", "libs/a"), |before, (file, body)| {
+                write(root, file, body);
+                let after = key_of(root, "build", "libs/a");
+                assert_eq!(before != after, changes, "{file}");
+                after
+            });
     }
 
     #[cfg(unix)]
     #[test]
-    fn outside_directory_links_honour_gitignore() {
+    fn links_to_ignored_workspace_dirs_hash_everything_behind_them() {
+        let dir = one_project();
+        let root = dir.path();
+        write(root, ".gitignore", "target/\n");
+        write(root, "target/wasm-pkg/pkg.js", "v1");
+        write(root, "target/wasm-pkg/.hidden", "v1");
+        std::os::unix::fs::symlink("../../../target/wasm-pkg", root.join("libs/a/src/linked"))
+            .unwrap();
+        assert_edits(
+            root,
+            true,
+            &[
+                ("target/wasm-pkg/pkg.js", "v2"),
+                ("target/wasm-pkg/new.js", "added"),
+                ("target/wasm-pkg/sub/deep.js", "added"),
+                ("target/wasm-pkg/.hidden", "v2"),
+            ],
+        );
+        assert_edits(
+            root,
+            false,
+            &[
+                ("target/wasm-pkg/node_modules/x.js", "skipped"),
+                ("target/wasm-pkg/.git/HEAD", "skipped"),
+                ("target/wasm-pkg/.axonal/filehash.json", "skipped"),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_into_node_modules_hash_their_target() {
+        let dir = one_project();
+        let root = dir.path();
+        write(root, "node_modules/pdfjs/build/pdf.js", "v1");
+        std::os::unix::fs::symlink(
+            "../../../node_modules/pdfjs/build",
+            root.join("libs/a/src/pdfjs"),
+        )
+        .unwrap();
+        assert_edits(
+            root,
+            true,
+            &[
+                ("node_modules/pdfjs/build/pdf.js", "v2"),
+                ("node_modules/pdfjs/build/worker.js", "added"),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_directory_links_hash_ignored_files() {
         let dir = one_project();
         let outside = tempfile::tempdir().unwrap();
         write(outside.path(), ".gitignore", "dist/\n");
         write(outside.path(), "src/x.ts", "x");
         write(outside.path(), "dist/x.js", "built 1");
-        write(outside.path(), ".axonal/filehash.json", "{}");
         std::os::unix::fs::symlink(outside.path(), dir.path().join("libs/a/src/ext")).unwrap();
-        let before = key_of(dir.path(), "build", "libs/a");
-        write(outside.path(), "dist/x.js", "built 2");
-        write(outside.path(), ".axonal/filehash.json", "{\"x\":1}");
-        assert_eq!(key_of(dir.path(), "build", "libs/a"), before);
-        write(outside.path(), "src/x.ts", "y");
-        assert_ne!(key_of(dir.path(), "build", "libs/a"), before);
+        let outside_files = |rels: &[&str]| -> Vec<String> {
+            rels.iter()
+                .map(|rel| outside.path().join(rel).to_str().unwrap().to_string())
+                .collect()
+        };
+        let changing = outside_files(&["dist/x.js", "dist/new.js", "src/x.ts"]);
+        let skipped = outside_files(&[".axonal/filehash.json", "node_modules/m/i.js"]);
+        let changing: Vec<(&str, &str)> = changing.iter().map(|f| (f.as_str(), "2")).collect();
+        let skipped: Vec<(&str, &str)> = skipped.iter().map(|f| (f.as_str(), "2")).collect();
+        assert_edits(dir.path(), true, &changing);
+        assert_edits(dir.path(), false, &skipped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_directory_links_are_followed() {
+        let dir = one_project();
+        let root = dir.path();
+        write(root, "shared/x.ts", "x");
+        write(root, "assets/img.txt", "1");
+        std::os::unix::fs::symlink("../assets", root.join("shared/assets")).unwrap();
+        std::os::unix::fs::symlink("../../../shared", root.join("libs/a/src/shared")).unwrap();
+        assert_edits(
+            root,
+            true,
+            &[("assets/img.txt", "2"), ("assets/more/new.txt", "added")],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_link_loops_terminate() {
+        use std::os::unix::fs::symlink;
+        let dir = one_project();
+        let root = dir.path();
+        write(root, "shared/a/x.ts", "x");
+        write(root, "shared/b/y.ts", "y");
+        symlink("..", root.join("shared/a/up")).unwrap();
+        symlink("../b", root.join("shared/a/b")).unwrap();
+        symlink("../a", root.join("shared/b/a")).unwrap();
+        symlink("../../../shared", root.join("libs/a/src/shared")).unwrap();
+        assert_edits(
+            root,
+            true,
+            &[("shared/a/x.ts", "2"), ("shared/b/y.ts", "2")],
+        );
     }
 
     /// `f`'s result, or `None` if it hasn't finished after 1.5 s.
@@ -1941,11 +1996,11 @@ command = "tsc"
         let rel = PathBuf::from(rel);
         prompt(move || {
             match FileHashCache::default()
-                .regular(&root, &root, &rel, &meta, Follow::Directories)
+                .regular(&root, &rel, &meta, Follow::Directories)
                 .unwrap()
             {
                 Computed::Hashed(h) => (h.digest, h.stamp.is_some()),
-                Computed::WorkspaceDir { .. } => panic!("not a directory link"),
+                Computed::DirLink { .. } => panic!("not a directory link"),
             }
         })
     }
